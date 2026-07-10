@@ -167,6 +167,18 @@ do
   local a, b, c, dch, e, gsha = hx.parse.fwmeta(hx.pack.fwmeta(1, 12, tx.size, tx.count, 4096, sha))
   check("fwmeta roundtrip", a == 1 and b == 12 and c == tx.size and dch == tx.count
     and e == 4096 and gsha == sha)
+
+  -- boot0's inline parser splits FW_META/FW_CHUNK by fixed offsets; lock them so
+  -- the EEPROM code can't silently diverge from the framing again.
+  local metaBody = hx.pack.fwmeta(7, 3, 1000, 9, 4096, sha)
+  local _, _, _, _, _, mp = string.unpack("<I2I2I4I2I2", metaBody)
+  check("fwmeta header is 12 bytes (sha at 13)", mp == 13, mp)
+  check("boot0 reads sha at the cursor", metaBody:sub(mp, mp + 31) == sha)
+  local data = "chunk-payload-bytes"
+  local chunkBody = hx.pack.fwchunk(7, 2, data)
+  local _, _, cp = string.unpack("<I2I2", chunkBody)
+  check("fwchunk header is 4 bytes (data at 5)", cp == 5, cp)
+  check("boot0 reads chunk data at the cursor", chunkBody:sub(cp) == data)
 end
 
 -- mini radio simulator: multi-hop flood + coverage convergence ------------

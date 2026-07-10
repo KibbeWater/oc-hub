@@ -68,11 +68,11 @@ while true do
         local n, _, lfw, qx, qy, qz = string.unpack("<c8I2I2i2i2i2B", f.b)
         if n == no then qn = { x = qx, y = qy, z = qz }; jn = true; st("DL..."); req(); lr = computer.uptime() end
       elseif f.t == 0x32 and f.sg and ver(f) then
-        local xi, vr, sz, ct = string.unpack("<I2I2I4I2I2", f.b)
-        meta = { xi = xi, vr = vr, ct = ct, sha = f.b:sub(19, 50) }; rx = {}
+        local xi, vr, sz, ct, cs, p = string.unpack("<I2I2I4I2I2", f.b)
+        meta = { xi = xi, vr = vr, ct = ct, sha = f.b:sub(p, p + 31) }; rx = {}
       elseif f.t == 0x33 and meta then
-        local xi, ix = string.unpack("<I2I2", f.b)
-        if xi == meta.xi and not rx[ix] then rx[ix] = f.b:sub(9) end
+        local xi, ix, p = string.unpack("<I2I2", f.b)
+        if xi == meta.xi and not rx[ix] then rx[ix] = f.b:sub(p) end
       end
     end
   end
