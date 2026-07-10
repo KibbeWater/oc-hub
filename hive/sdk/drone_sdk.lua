@@ -1,0 +1,269 @@
+-- drone_sdk.lua: the device-side runtime for drone role firmware.
+-- Provides hive.main(role, ctx): the outer state machine (join -> idle <-> work),
+-- heartbeats, command dispatch, watchdog-safe pacing, and the api helpers roles
+-- call (goTo/scanColumn/report/status/sleep/aborted). All I/O is injected via ctx
+-- so the same code runs in the netboot sandbox and in the desktop simulator.
+-- Bundled into every drone image; install source to /usr/lib/hive/sdk/drone_sdk.lua.
+--
+-- ctx fields:
+--   id, key, hmac(msg,key), now()->s, send(wire,to), pull(timeout)->signal tuple,
+--   queen {x,y,z}, port, fw, role (numeric), nonce, home {x,y,z},
+--   navPos()->x,y,z | nil, droneMove(dx,dy,dz), droneOffset()->n,
+--   geoScan(rx,rz,ry,w,d,h)->{hardness...}, energy()->0..1,
+--   setStatus(l1,l2) [opt], setLight(rgb) [opt], reboot() [opt],
+--   suckBelow()/dropBelow() [courier, opt].
+
+local hxnet = require("hxnet")
+local navcore = require("navcore")
+local worldscan = require("worldscan")
+
+local sdk = {}
+
+-- Task payload codec (queen ASSIGN <-> device). Keep tiny -- no serialization lib
+-- on a drone. type 1 = scan_tile{cx,cz}; type 2 = ferry{fx,fz,tx,tz}.
+local TASK = { SCAN_TILE = 1, FERRY = 2 }
+sdk.TASK = TASK
+
+function sdk.encodeTask(t)
+  if t.type == "scan_tile" then
+    return string.pack("<Bi2i2", TASK.SCAN_TILE, t.cx or t.params.cx, t.cz or t.params.cz)
+  end
+  return string.pack("<B", 0)
+end
+
+local function decodeTask(payload)
+  local tt = string.unpack("<B", payload)
+  if tt == TASK.SCAN_TILE then
+    local _, cx, cz = string.unpack("<Bi2i2", payload)
+    return { type = "scan_tile", cx = cx, cz = cz }
+  end
+  return nil
+end
+
+local floor = math.floor
+
+function sdk.main(role, ctx)
+  local node = hxnet.new{ id = ctx.id, key = ctx.key, hmac = ctx.hmac, now = ctx.now, send = ctx.send }
+  local queen = ctx.queen or { x = 0, y = 64, z = 0 }
+  local state = { task = nil, aborted = false, recall = false, reboot = false,
+    otaVer = nil, lastHB = 0, hbInterval = 10, runState = hxnet.STATE.BOOT,
+    latestFw = ctx.fw or 0, joined = false, routeId = 0 }
+
+  local function sendEvt(sub, detail)
+    node:cast(hxnet.QUEEN, hxnet.T.EVT, hxnet.pack.evt(0, sub, 0, detail or ""), { ttl = 3 })
+  end
+
+  local nav = navcore.new{ kind = "drone", io = {
+    pos = ctx.navPos, move = ctx.droneMove, offset = ctx.droneOffset,
+    energy = ctx.energy, now = ctx.now,
+    report = function(sc) sendEvt(sc) end,
+    status = ctx.setStatus,
+  } }
+
+  -- --- message pump --------------------------------------------------------
+
+  local function pumpOnce(timeout)
+    local ev = { ctx.pull(timeout or 0) }
+    if ev[1] == "modem_message" then
+      -- (name, localAddr, remoteAddr, port, distance, message)
+      node:submit(ev[3], ev[5] or 0, ev[6])
+    end
+    return ev[1]
+  end
+
+  local function heartbeat(force)
+    local t = ctx.now()
+    if force or (t - state.lastHB) >= state.hbInterval then
+      local x, y, z = ctx.navPos()
+      node:cast(hxnet.QUEEN, hxnet.T.TELEM,
+        hxnet.pack.telem(x or 0, y or 0, z or 0, floor((ctx.energy() or 0) * 100),
+          state.runState, ctx.fw or 0, ctx.role or 0), { ttl = 3 })
+      state.lastHB = t
+    end
+  end
+
+  -- --- api -----------------------------------------------------------------
+
+  local api = {}
+  function api.pos() return ctx.navPos() end
+  function api.energy() return ctx.energy() end
+  function api.task() return state.task end
+  function api.aborted() return state.aborted end
+  function api.queen() return queen end
+  function api.home() return ctx.home end
+  function api.sleep(sec) pumpOnce(sec) end
+  function api.status(l1, l2)
+    if ctx.setStatus then ctx.setStatus(l1 or "", l2 or "") end
+  end
+  function api.report(pct, note)
+    state.runState = hxnet.STATE.WORKING
+    heartbeat(true)
+  end
+
+  -- Drive navcore to arrival/blocked while pumping messages and pacing the CPU.
+  local function runNav()
+    while true do
+      pumpOnce(0.25)
+      if state.aborted then nav.cancel("aborted"); return false, "aborted" end
+      local st = nav.tick()
+      heartbeat()
+      if st == "arrived" then return true end
+      if st == "blocked" then return false, "blocked" end
+    end
+  end
+
+  -- Fly to (x,y,z). opts.cruise sets transit altitude; opts.scanDescend probes
+  -- unknown columns on the way down. Returns true | false, reason.
+  function api.goTo(tx, ty, tz, opts)
+    opts = opts or {}
+    local px, py, pz = ctx.navPos()
+    if not px then return false, "no_fix" end
+    local cruise = opts.cruise or (math.max(py, ty) + 8)
+    state.routeId = (state.routeId + 1) % 65536
+    -- leg ops: 1 CLIMB_TO, 2 GOTO, 3 DESCEND_TO (must match routes.OP / navcore)
+    local ok, err = nav.setRoute(state.routeId, {
+      { op = 1, x = px, y = cruise, z = pz },
+      { op = 2, x = tx, y = cruise, z = tz },
+      { op = 3, x = tx, y = ty, z = tz, param = opts.scanDescend and 8 or 0 },
+    })
+    if not ok then return false, err end
+    return runNav()
+  end
+
+  -- Short same-altitude hop (single GOTO leg) -- used for column-to-column scanning.
+  function api.moveTo(tx, ty, tz)
+    state.routeId = (state.routeId + 1) % 65536
+    local ok, err = nav.setRoute(state.routeId, { { op = 2, x = tx, y = ty, z = tz } })
+    if not ok then return false, err end
+    return runNav()
+  end
+
+  -- Scan the column beneath the drone and return a packed uplink record.
+  function api.scanColumn()
+    local px, py, pz = ctx.navPos()
+    local col = ctx.geoScan(0, 0, -32, 1, 1, 64) -- 64 values, yBase = py-32
+    local surfaceY, flags, oreY, oreConf = worldscan.reduceColumn(col, (py or 64) - 32,
+      (py or 64) - ((py or 64) - 32)) -- vertical distance ~ 32
+    return worldscan.packUplink(px, pz, surfaceY, flags, oreY, oreConf)
+  end
+
+  function api.uploadScan(batch) sendEvt(hxnet.EVT.SCAN, batch) end
+
+  -- --- command dispatch ----------------------------------------------------
+
+  local function dispatch(op, payload)
+    if op == hxnet.CMD.ASSIGN then
+      state.task = decodeTask(payload)
+    elseif op == hxnet.CMD.RECALL then
+      state.recall = true; state.aborted = true
+    elseif op == hxnet.CMD.ABORT then
+      state.aborted = true
+    elseif op == hxnet.CMD.REBOOT then
+      state.reboot = true; state.aborted = true
+    elseif op == hxnet.CMD.LOCATE then
+      if ctx.setLight then ctx.setLight(0x00FF88) end
+    elseif op == hxnet.CMD.NAV_ROUTE then
+      nav.setRoute(0, payload) -- queen-planned route blob
+    end
+  end
+
+  node:on(hxnet.T.WELCOME, function(f)
+    local nonce, dev, latestFw, qx, qy, qz = hxnet.parse.welcome(f.body)
+    if ctx.nonce and nonce ~= ctx.nonce then return end -- bind to our HELLO
+    queen = { x = qx, y = qy, z = qz }
+    state.latestFw = latestFw
+    state.joined = true
+    if latestFw and latestFw > (ctx.fw or 0) then state.otaVer = latestFw end
+  end)
+  node:on(hxnet.T.CMD, function(f)
+    local op, payload = hxnet.parse.cmd(f.body)
+    dispatch(op, payload)
+  end)
+  node:on(hxnet.T.FW_ANNOUNCE, function(f)
+    local r, ver = hxnet.parse.announce(f.body)
+    if r == ctx.role and ver > (ctx.fw or 0) then state.otaVer = ver end
+  end)
+  node:on(hxnet.T.PING, function() node:cast(hxnet.QUEEN, hxnet.T.PONG,
+    hxnet.pack.pong(ctx.fw or 0, state.runState), { ttl = 3 }) end)
+
+  -- --- join + main loop ----------------------------------------------------
+
+  if ctx.joined then
+    -- the bootloader already authenticated + learned the queen; skip re-join
+    state.joined = true
+  else
+    node:cast(hxnet.QUEEN, hxnet.T.HELLO,
+      hxnet.pack.hello(ctx.nonce or "hxdrone0", ctx.role or 1, ctx.fw or 0), { ttl = 5 })
+    local tries = 0
+    while not state.joined and tries < 40 do
+      pumpOnce(0.25); tries = tries + 1
+    end
+  end
+  state.runState = hxnet.STATE.IDLE
+  if role.onInit then role.onInit(api) end
+
+  local guard = 0
+  while not state.reboot do
+    guard = guard + 1
+    if ctx.maxSteps and guard > ctx.maxSteps then break end -- sim safety
+    pumpOnce(0.25)
+    heartbeat()
+    if state.otaVer and not state.task then
+      if ctx.reboot then ctx.reboot() end
+      break
+    end
+    if state.task then
+      state.aborted = false
+      state.runState = hxnet.STATE.WORKING
+      local ok, detail = role.onTask(api, state.task)
+      state.task = nil
+      state.runState = hxnet.STATE.IDLE
+      if ok == "done" or ok == true then sendEvt(hxnet.EVT.DONE)
+      else sendEvt(hxnet.EVT.FAILED, tostring(detail or "")) end
+      if state.recall then
+        state.recall = false; state.aborted = false
+        if role.onLowEnergy then role.onLowEnergy(api) end
+      end
+    elseif role.onIdle then
+      role.onIdle(api)
+    end
+  end
+  if state.reboot and ctx.reboot then ctx.reboot() end
+end
+
+-- In-game entry point: build ctx from the bare-sandbox globals (component,
+-- computer) and the boot0 handoff table _HX, then run. Called by the firmware
+-- bundle's entry line. Not used by the desktop harness (which calls main directly).
+function sdk.mainFromComponents(role)
+  local hx = _HX or {}
+  local drone = component.proxy(component.list("drone")())
+  local nav = component.proxy(component.list("navigation")())
+  local geo = component.list("geolyzer")() and component.proxy(component.list("geolyzer")())
+  local modem = component.proxy(component.list("modem")())
+  local data = component.proxy(component.list("data")())
+  local port = hx.port or 4460
+  modem.open(port)
+  if modem.isWireless and modem.isWireless() then pcall(modem.setStrength, 400) end
+
+  local ctx = {
+    id = hx.id, key = hx.key, role = hx.role or 1, fw = hx.fw or 0,
+    queen = hx.queen or { x = 0, y = 64, z = 0 }, home = hx.home, joined = hx.joined,
+    hmac = function(msg, key) return data.sha256(msg, key) end,
+    now = function() return computer.uptime() end,
+    send = function(wire, to)
+      if to then modem.send(to, port, wire) else modem.broadcast(port, wire) end
+    end,
+    pull = function(timeout) return computer.pullSignal(timeout) end,
+    navPos = function() return nav.getPosition() end,
+    droneMove = function(dx, dy, dz) drone.move(dx, dy, dz) end,
+    droneOffset = function() return drone.getOffset() end,
+    geoScan = function(rx, rz, ry, w, d, h) return geo and geo.scan(rx, rz, ry, w, d, h) or {} end,
+    energy = function() return computer.energy() / computer.maxEnergy() end,
+    setStatus = function(l1, l2) pcall(drone.setStatusText, ((l1 or "") .. "\n" .. (l2 or "")):sub(1, 21)) end,
+    setLight = function(rgb) pcall(drone.setLightColor, rgb) end,
+    reboot = function() computer.shutdown(true) end,
+  }
+  return sdk.main(role, ctx)
+end
+
+return sdk
