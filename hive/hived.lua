@@ -126,9 +126,16 @@ local function cmdRun()
     send = function(wire, to)
       if to then modem.send(to, cfg.port, wire) else modem.broadcast(cfg.port, wire) end
     end,
-    firmwareProvider = function(role, stage)
+    firmwareProvider = function(roleNum, stage)
       if stage ~= 0 then return nil end
-      return svc.firmware.build(role)
+      local name = ROLE_NAME[roleNum] or "scout"
+      local img, ver, sha = svc.firmware.build(name)
+      if not img then
+        svc.log.alert("firmware build failed for %s: %s", name, tostring(ver))
+        return nil
+      end
+      svc.log.info("serving %s v%s (%d B)", name, tostring(ver), #img)
+      return img, ver, sha
     end }
   net.enableFirmwareServer()
   shared.net = net

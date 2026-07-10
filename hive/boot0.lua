@@ -78,6 +78,7 @@ while true do
   end
   local t = computer.uptime()
   if not jn and t - lh >= 2 then hello(); lh = t end
+  if jn and not meta and t - lr >= 3 then req(); lr = t end -- retry the fw request
   if meta and t - lr >= 1 then
     local mi = {}
     for i = 0, meta.ct - 1 do if not rx[i] then mi[#mi + 1] = i end end
