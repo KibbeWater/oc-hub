@@ -217,6 +217,40 @@ check("hybrid beats solo", sH.dropped < s2.dropped,
 print(string.format("     hybrid: %d played (%d bank), %d dropped (%.1f%%)",
   sH.played, sH.bank, sH.dropped, 100 * sH.dropped / sH.total))
 
+-- calibration partitioning (server blades sharing one block network) -----
+
+local shared = {
+  blocks = {
+    a = 0, b = 0, c = 0, d = 0, -- four pianos
+    e = 5, f = 5,               -- two guitars
+    x = 7, y = 7,               -- bells owned by the bank below
+  },
+  banks = { { addr = "rs1", sides = { [0] = "x", [2] = "y" } } },
+}
+local p1 = nbs.partitionCalibration(shared, 1, 2)
+local p2 = nbs.partitionCalibration(shared, 2, 2)
+local function countBlocks(cfg)
+  local total = 0
+  for _ in pairs(cfg.blocks) do total = total + 1 end
+  return total
+end
+local disjoint = true
+for address in pairs(p1.blocks) do
+  if p2.blocks[address] then disjoint = false end
+end
+check("partitions are disjoint", disjoint)
+check("partition sizes", countBlocks(p1) == 5 and countBlocks(p2) == 3,
+  countBlocks(p1) .. "/" .. countBlocks(p2))
+check("each partition gets pianos",
+  (p1.blocks.a or p1.blocks.b or p1.blocks.c or p1.blocks.d) ~= nil
+  and (p2.blocks.a or p2.blocks.b or p2.blocks.c or p2.blocks.d) ~= nil)
+check("bank follows partition 1", #p1.banks == 1 and #p2.banks == 0)
+check("bank blocks stay with their bank",
+  p1.blocks.x == 7 and p1.blocks.y == 7
+  and p2.blocks.x == nil and p2.blocks.y == nil)
+local p11 = nbs.partitionCalibration(shared, 1, 1)
+check("1/1 partition keeps everything", countBlocks(p11) == 8 and #p11.banks == 1)
+
 -- classic v0 parsing -----------------------------------------------------
 
 local function u16le(v) return string.char(v % 256, math.floor(v / 256) % 256) end

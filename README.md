@@ -288,7 +288,29 @@ playback needs no coordination traffic. With the test song, one 4-block
 computer drops 39% of notes; four computers drop none. The schedule report
 before playback shows exactly what was dropped.
 
-### Redstone banks: more speed without more computers
+### Server racks: more speed with ZERO extra setup
+
+The cheapest multiplier reuses the note blocks you already calibrated.
+Every server blade in a Server Rack is a **full, independent OC machine**
+with its own one-synchronized-call-per-tick slot — and through the rack's
+side buses they all see the *same* component network, i.e. the same
+note_block addresses your first computer uses. Since calibration is keyed
+by those network-global addresses, it copies over as-is:
+
+1. Place a rack next to your existing setup, wire its bus to the adapter
+   network, insert server blades (each needs CPU/RAM/wireless card).
+2. On each blade: `noteplayer import 2/4` (= "I am machine 2 of 4"), then
+   run `noteplayer`. The blade fetches the calibration from the running
+   daemon over the network and keeps every 4th block. On the original
+   computer, re-run `noteplayer import 1/4` (it re-splits from its saved
+   full copy in `/etc/noteplayer.full.cfg`).
+3. Play. Four blades = 4x the notes/second on the same physical blocks.
+
+The n/m split matters: two machines triggering the *same* block in the
+same tick race on its pitch (Minecraft dedupes the block event), so each
+machine must own a disjoint subset. `import` guarantees that.
+
+### Redstone banks: more parallel chords per machine
 
 Straight from the OC source: `redstone.setOutput{...}` is also a
 synchronized call (plus a `misc.redstoneDelay` machine pause, 0.1s by

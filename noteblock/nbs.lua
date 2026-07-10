@@ -537,6 +537,50 @@ function nbs.readRecord(blob, i)
   return (t1 + t2 * 256 + t3 * 65536) / 100, kind, a, b
 end
 
+-- Splits a noteplayer calibration between m machines that share one
+-- component network (e.g. server blades in a rack, which all see the same
+-- note_block addresses). Machine n (1-based) takes every m-th block of
+-- each instrument and every m-th redstone bank, so no two machines ever
+-- fight over the same block in the same game tick (the block event would
+-- dedupe and the pitches would race).
+function nbs.partitionCalibration(config, n, m)
+  local bankOwned = {}
+  for _, bank in ipairs(config.banks or {}) do
+    for _, address in pairs(bank.sides or {}) do
+      bankOwned[address] = true
+    end
+  end
+
+  -- deterministic split of the dynamic blocks, per instrument
+  local byInst = {}
+  for address, inst in pairs(config.blocks or {}) do
+    if not bankOwned[address] then
+      byInst[inst] = byInst[inst] or {}
+      table.insert(byInst[inst], address)
+    end
+  end
+  local blocks = {}
+  for inst, list in pairs(byInst) do
+    table.sort(list)
+    for i, address in ipairs(list) do
+      if (i - 1) % m == n - 1 then blocks[address] = inst end
+    end
+  end
+
+  -- whole bank devices round-robin; their blocks follow their device
+  local banks = {}
+  for i, bank in ipairs(config.banks or {}) do
+    if (i - 1) % m == n - 1 then
+      banks[#banks + 1] = bank
+      for _, address in pairs(bank.sides or {}) do
+        blocks[address] = (config.blocks or {})[address]
+      end
+    end
+  end
+
+  return { blocks = blocks, banks = banks }
+end
+
 -- Expands a volley side mask into a setOutput() table for sides 0-5.
 function nbs.maskToSides(mask)
   local values = {}

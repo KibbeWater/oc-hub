@@ -14,12 +14,17 @@
 -- Usage:
 --   noteplayer                daemon: wait for a master (Ctrl+C stops)
 --   noteplayer calibrate      assign instruments + map redstone banks
+--   noteplayer import [n/m]   copy calibration from another machine on the
+--                             same component network, taking every m-th
+--                             block (for server blades sharing one set of
+--                             note blocks: blade 2 of 4 -> 'import 2/4')
 --   noteplayer test           play a quick scale on every block
 --   noteplayer status         show the current calibration
 -- Options: --port=3001
 --
--- Calibration lives in /etc/noteplayer.cfg. A calibration.dat from the
--- old NoteblockPlayer is migrated automatically on first run.
+-- Calibration lives in /etc/noteplayer.cfg (the unsplit original in
+-- /etc/noteplayer.full.cfg). A calibration.dat from the old
+-- NoteblockPlayer is migrated automatically on first run.
 
 local component = require("component")
 local computer = require("computer")
@@ -29,6 +34,7 @@ local serialization = require("serialization")
 local shell = require("shell")
 
 local CONFIG = "/etc/noteplayer.cfg"
+local FULL_CONFIG = "/etc/noteplayer.full.cfg"
 local PROTOCOL = "NBP2"
 
 local args, opts = shell.parse(...)
@@ -111,11 +117,23 @@ local function loadConfig()
   return data
 end
 
-local function saveConfig(config)
-  local f, err = io.open(CONFIG, "w")
+local function saveConfig(config, path)
+  local f, err = io.open(path or CONFIG, "w")
   if not f then fail("cannot save calibration: " .. tostring(err)) end
   f:write(serialization.serialize(config))
   f:close()
+end
+
+-- The complete, unsplit calibration: kept separately so 'import n/m' can
+-- always re-partition from the original, and served to other machines.
+local function loadFullConfig()
+  local f = io.open(FULL_CONFIG, "r")
+  if f then
+    local data = serialization.unserialize(f:read("*a") or "") or {}
+    f:close()
+    if data.blocks then return data end
+  end
+  return nil
 end
 
 -- Splits calibrated blocks into dynamic (adapter-triggered) and bank
@@ -234,6 +252,7 @@ local function commandCalibrate()
   end
 
   saveConfig(config)
+  saveConfig(config, FULL_CONFIG)
   print("")
   print("Saved to " .. CONFIG .. ":")
   local _, counts, banks = buildSetup(config)
@@ -245,6 +264,75 @@ local function commandCalibrate()
     for _ in pairs(bank.sides) do n = n + 1 end
     printf("  bank %d: %d channel(s)", i, n)
   end
+end
+
+-- Copies the calibration of another machine on the same component network
+-- (or this machine's own full copy) and keeps every m-th block, so several
+-- machines - e.g. server blades in one rack - can share one set of note
+-- blocks without ever triggering the same block in the same tick.
+local function commandImport(spec)
+  local n, m = 1, 1
+  if spec then
+    local a, b = spec:match("^(%d+)/(%d+)$")
+    n, m = tonumber(a), tonumber(b)
+    if not n or not m or m < 1 or n < 1 or n > m then
+      fail("usage: noteplayer import [<n>/<m>], e.g. 'import 2/4' for machine 2 of 4")
+    end
+  end
+
+  local full = loadFullConfig()
+  if not full then
+    if not component.isAvailable("modem") then
+      fail("no local calibration and no network card to fetch one")
+    end
+    local modem = component.modem
+    modem.open(port)
+    if modem.isWireless() then pcall(modem.setStrength, 400) end
+    print("requesting calibration from other nodes...")
+    modem.broadcast(port, PROTOCOL, "getcal")
+    local deadline = computer.uptime() + 3
+    while computer.uptime() < deadline and not full do
+      local sig = table.pack(event.pull(
+        math.max(0.05, deadline - computer.uptime()), "modem_message"))
+      if sig[1] == "modem_message" and sig[4] == port
+        and sig[6] == PROTOCOL and sig[7] == "cal" then
+        local data = serialization.unserialize(tostring(sig[8] or "")) or {}
+        if data.blocks and next(data.blocks) then full = data end
+      end
+    end
+    modem.close(port)
+    if not full then
+      fail("no calibrated node answered; run the noteplayer daemon on the"
+        .. " machine that was calibrated")
+    end
+    saveConfig(full, FULL_CONFIG)
+  end
+
+  local mine = nbs.partitionCalibration(full, n, m)
+  -- keep only what this machine can actually reach
+  local blocks, blockCount = {}, 0
+  for address, inst in pairs(mine.blocks) do
+    if component.type(address) == "note_block" then
+      blocks[address] = inst
+      blockCount = blockCount + 1
+    end
+  end
+  mine.blocks = blocks
+  local banks = {}
+  for _, bank in ipairs(mine.banks) do
+    if component.type(bank.addr) == "redstone" then
+      banks[#banks + 1] = bank
+    end
+  end
+  mine.banks = banks
+
+  if blockCount == 0 and #banks == 0 then
+    fail("partition " .. n .. "/" .. m .. " contains nothing this machine can reach")
+  end
+  saveConfig(mine)
+  printf("imported as machine %d of %d: %d block(s), %d bank(s) -> %s",
+    n, m, blockCount, #banks, CONFIG)
+  print("run 'noteplayer status' to inspect, then start the daemon")
 end
 
 local function commandStatus()
@@ -389,9 +477,13 @@ local function commandDaemon()
     return applied
   end
 
+  local shareConfig = serialization.serialize(loadFullConfig() or config)
+
   local function handleMessage(from, kind, a, b, c)
     if kind == "discover" then
       modem.send(from, port, PROTOCOL, "hello", helloPayload)
+    elseif kind == "getcal" then
+      modem.send(from, port, PROTOCOL, "cal", shareConfig)
     elseif kind == "song" then
       reset()
       master = from
@@ -479,6 +571,8 @@ end
 local command = args[1]
 if command == "calibrate" then
   commandCalibrate()
+elseif command == "import" then
+  commandImport(args[2])
 elseif command == "test" then
   commandTest()
 elseif command == "status" then
@@ -486,6 +580,6 @@ elseif command == "status" then
 elseif command == nil then
   commandDaemon()
 else
-  print("usage: noteplayer [calibrate|test|status] [--port=3001]")
+  print("usage: noteplayer [calibrate|import [n/m]|test|status] [--port=3001]")
   os.exit(1)
 end
