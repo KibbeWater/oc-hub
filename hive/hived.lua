@@ -232,12 +232,11 @@ end
 
 local function cmdSurvey()
   if not component.isAvailable("navigation") then
-    print("No navigation component on this machine (a server rack has no upgrade slot).")
-    print("Options:")
-    print("  * Put a Navigation Upgrade (crafted with a map) in an Adapter block wired")
-    print("    to the server, then re-run 'hived survey'.")
-    print("  * Or register points manually:  hived poi <kind> <x> <y> <z> [label]")
-    print("  * Scouts also auto-register waypoints they fly past.")
+    print("No navigation component here. A server rack (or any non-rotatable host)")
+    print("cannot use a navigation upgrade, so register points another way:")
+    print("  * By hand:  hived poi <kind> <x> <y> <z> [label]")
+    print("  * From a robot/drone/tablet that has a navigation upgrade")
+    print("  * Scouts auto-register waypoints they fly past")
     return
   end
   local nav = component.navigation
