@@ -11,6 +11,10 @@
 --   hived status          print fleet + task summary
 --   hived survey          sweep waypoints near the queen into the nav graph
 
+-- Resolve bare sibling requires (airspace, navcore, worldscan, ...) from the
+-- installed hive lib dirs; OpenOS only searches /usr/lib/?.lua by default.
+package.path = "/usr/lib/hive/core/?.lua;/usr/lib/hive/sdk/?.lua;/usr/lib/hive/roles/?.lua;" .. package.path
+
 local component = require("component")
 local computer = require("computer")
 local event = require("event")

@@ -8,6 +8,8 @@
 --   hivedev fake  <n>            inject N fake devices into the registry
 --   hivedev clearfake            remove fake devices (ids >= 1000)
 
+package.path = "/usr/lib/hive/core/?.lua;/usr/lib/hive/sdk/?.lua;/usr/lib/hive/roles/?.lua;" .. package.path
+
 local hxnet = require("hxnet")
 local boot = require("hive.core.bootstrap")
 local shared = require("hive.core.shared")

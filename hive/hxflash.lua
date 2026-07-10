@@ -4,6 +4,8 @@
 -- data area; or issues a PIN-protected pairing ticket for an OpenOS robot. Run on
 -- the queen with the target EEPROM inserted. Install to /usr/bin/hxflash.lua.
 
+package.path = "/usr/lib/hive/core/?.lua;/usr/lib/hive/sdk/?.lua;/usr/lib/hive/roles/?.lua;" .. package.path
+
 local component = require("component")
 local hxnet = require("hxnet")
 local boot = require("hive.core.bootstrap")

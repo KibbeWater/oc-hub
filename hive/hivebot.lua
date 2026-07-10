@@ -5,6 +5,8 @@
 --
 -- Usage:  hivebot [run] | pair | status | update
 
+package.path = "/usr/lib/hive/core/?.lua;/usr/lib/hive/sdk/?.lua;/usr/lib/hive/roles/?.lua;" .. package.path
+
 local component = require("component")
 local computer = require("computer")
 local serialization = require("serialization")

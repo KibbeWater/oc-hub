@@ -4,6 +4,8 @@
 -- Fleet, Device and Log screens; Tasks/Map/POIs arrive in later phases.
 -- Install to /usr/bin/hive.lua.
 
+package.path = "/usr/lib/hive/core/?.lua;/usr/lib/hive/sdk/?.lua;/usr/lib/hive/roles/?.lua;" .. package.path
+
 local component = require("component")
 local hxnet = require("hxnet")
 local ocui = require("ocui")
