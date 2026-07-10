@@ -232,7 +232,13 @@ end
 
 local function cmdSurvey()
   if not component.isAvailable("navigation") then
-    error("a Navigation Upgrade is required to survey waypoints")
+    print("No navigation component on this machine (a server rack has no upgrade slot).")
+    print("Options:")
+    print("  * Put a Navigation Upgrade (crafted with a map) in an Adapter block wired")
+    print("    to the server, then re-run 'hived survey'.")
+    print("  * Or register points manually:  hived poi <kind> <x> <y> <z> [label]")
+    print("  * Scouts also auto-register waypoints they fly past.")
+    return
   end
   local nav = component.navigation
   local svc = shared.svc or boot.bringUp(boot.loadConfig())
@@ -329,6 +335,23 @@ local function cmdHole(a)
     a[6] or "hole3", top, bot, x, z, yBot))
 end
 
+local function cmdPoi(a)
+  local svc = svcHandle()
+  local kind, x, y, z, label = a[2], tonumber(a[3]), tonumber(a[4]), tonumber(a[5]), a[6]
+  local valid = { charger_drone = true, charger_robot = true, depot = true,
+    waypoint = true, hub = true, home = true, field = true }
+  if not (kind and valid[kind] and x and y and z) then
+    print("usage: hived poi <charger_drone|charger_robot|depot|waypoint|hub|home|field> <x> <y> <z> [label]")
+    return
+  end
+  svc.poi.add{ kind = kind, pos = { x = x, y = y, z = z }, label = label }
+  local ngKind = ({ charger_drone = navgraphLib.KIND.CHARGER, charger_robot = navgraphLib.KIND.CHARGER,
+    depot = navgraphLib.KIND.DEPOT })[kind] or navgraphLib.KIND.WAYPOINT
+  svc.navgraph.addNode{ kind = ngKind, x = x, y = y, z = z, label = label }
+  svc.poi.save(); svc.navgraph.save()
+  print(("Registered %s POI at %d,%d,%d."):format(kind, x, y, z))
+end
+
 local function cmdTunnel(a)
   local svc = svcHandle()
   local ng = svc.navgraph
@@ -359,10 +382,12 @@ elseif cmd == "ferry" then cmdFerry(args)
 elseif cmd == "farm" then cmdFarm(args)
 elseif cmd == "hole" then cmdHole(args)
 elseif cmd == "tunnel" then cmdTunnel(args)
+elseif cmd == "poi" then cmdPoi(args)
 else
   print("hived - hive queen daemon")
   print("usage: hived init | run | status | survey")
   print("       scan <x1 z1 x2 z2> | mine <x1 y1 z1 x2 y2 z2>")
   print("       ferry <fx fy fz tx ty tz [n]> | farm <x y z w l>")
+  print("       poi <kind x y z [label]>")
   print("       hole <x z yTop yBot [type]> | tunnel <x1 y1 z1 x2 y2 z2 [type]>")
 end
