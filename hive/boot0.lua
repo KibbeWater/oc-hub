@@ -92,6 +92,7 @@ while true do
       -- lossless, so a complete transfer of the right size is the image; load()
       -- compile-checks it before we commit to running.
       if #img == meta.sz then
+        snd(0x34, 0, string.pack("<I2I2", meta.xi, 0)) -- ack: transfer complete
         _HX = { id = id, key = k, role = role, port = port, queen = qn,
           home = { x = hx, y = hy, z = hz }, fw = meta.vr, joined = true }
         local fn = load(img, "=hxfw")

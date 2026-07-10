@@ -18,6 +18,8 @@ function netshim.new(opts)
   local hmac = opts.hmac
   local chunkSize = opts.chunkSize or 4096
   local provider = opts.firmwareProvider
+  local pace = opts.pace or function() end   -- optional inter-chunk delay
+  local logf = opts.log or function() end
 
   local node = hxnet.new{
     id = opts.id or hxnet.QUEEN,
@@ -95,8 +97,10 @@ function netshim.new(opts)
     node:cast(devId, hxnet.T.FW_META,
       hxnet.pack.fwmeta(xferId, version, tx.size, tx.count, chunkSize, sha),
       { ttl = 5, signed = true })
+    logf("transfer to %d: %d chunks, %d B", devId, tx.count, tx.size)
     for i = 0, tx.count - 1 do
       node:cast(devId, hxnet.T.FW_CHUNK, hxnet.pack.fwchunk(xferId, i, tx.chunk(i)), { ttl = 5 })
+      pace() -- space chunks so a burst doesn't overrun the receiver
     end
   end
 
@@ -114,10 +118,13 @@ function netshim.new(opts)
       if not t or t.xferId ~= xferId then return end
       if #missing == 0 then
         transfers[f.src] = nil -- verified-complete ack
+        logf("transfer to %d complete", f.src)
         return
       end
+      logf("resend %d chunk(s) to %d", #missing, f.src)
       for _, idx in ipairs(missing) do
         node:cast(f.src, hxnet.T.FW_CHUNK, hxnet.pack.fwchunk(xferId, idx, t.tx.chunk(idx)), { ttl = 5 })
+        pace()
       end
     end)
   end

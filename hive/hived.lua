@@ -122,7 +122,10 @@ local function cmdRun()
   if modem.setStrength then modem.setStrength(cfg.strength) end
 
   local net = netshim.new{ id = hxnet.QUEEN, master = svc.master, hmac = makeHmac(),
-    now = boot.now, epoch = svc.epoch, chunkSize = 3996,
+    now = boot.now, epoch = svc.epoch, chunkSize = 3996, log = svc.log.info,
+    -- space firmware chunks so a burst doesn't overrun the drone's receive queue;
+    -- a brief busy-wait avoids os.sleep stealing the daemon's modem events.
+    pace = function() local t = computer.uptime() + 0.03; while computer.uptime() < t do end end,
     send = function(wire, to)
       if to then modem.send(to, cfg.port, wire) else modem.broadcast(cfg.port, wire) end
     end,
