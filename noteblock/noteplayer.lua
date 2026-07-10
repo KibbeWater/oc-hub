@@ -47,13 +47,18 @@ local function fail(msg)
   os.exit(1)
 end
 
--- catch a stale nbs.lua shadowing the installed one
+-- OpenOS caches required libraries until reboot; drop the cache and
+-- reload before giving up on a version mismatch
+if nbs.VERSION ~= 3 then
+  package.loaded.nbs = nil
+  nbs = require("nbs")
+end
 if nbs.VERSION ~= 3 then
   local where = package.searchpath
     and package.searchpath("nbs", package.path) or "an unknown path"
   fail("outdated nbs library loaded from " .. tostring(where)
     .. "; delete that stale copy (the current one installs to"
-    .. " /usr/lib/nbs.lua)")
+    .. " /usr/lib/nbs.lua), or reboot")
 end
 
 ------------------------------------------------------------ calibration --

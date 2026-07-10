@@ -52,10 +52,6 @@ local PAGE_SIZE = 8
 local args, opts = shell.parse(...)
 local port = tonumber(opts.port) or 3001
 
--- let the nbs library yield inside its heavy loops so large songs don't
--- trip the "too long without yielding" watchdog
-nbs.onYield = function() os.sleep(0) end
-
 local function printf(fmt, ...) io.write(string.format(fmt, ...), "\n") end
 
 local function fail(msg)
@@ -63,15 +59,24 @@ local function fail(msg)
   os.exit(1)
 end
 
--- catch a stale nbs.lua shadowing the installed one (package.path checks
--- /lib and other locations before/after /usr/lib)
+-- OpenOS caches required libraries until reboot, so after an update the
+-- old nbs module can linger in package.loaded even though the file on
+-- disk is new; drop the cache and reload before giving up
+if nbs.VERSION ~= 3 then
+  package.loaded.nbs = nil
+  nbs = require("nbs")
+end
 if nbs.VERSION ~= 3 then
   local where = package.searchpath
     and package.searchpath("nbs", package.path) or "an unknown path"
   fail("outdated nbs library loaded from " .. tostring(where)
     .. "; delete that stale copy (the current one installs to"
-    .. " /usr/lib/nbs.lua via 'ocgit install')")
+    .. " /usr/lib/nbs.lua via 'ocgit install'), or reboot")
 end
+
+-- let the nbs library yield inside its heavy loops so large songs don't
+-- trip the "too long without yielding" watchdog
+nbs.onYield = function() os.sleep(0) end
 
 local function fmtTime(seconds)
   seconds = math.max(0, math.floor(seconds + 0.5))
