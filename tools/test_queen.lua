@@ -5,6 +5,7 @@
 -- injected chunk loss and NAK repair.
 
 package.path = "hive/core/?.lua;hive/?.lua;tools/?.lua;" .. package.path
+local gpsfix = require("gpsfix")
 local firmware = require("firmware")
 local registry = require("registry")
 local netshim = require("netshim")
@@ -83,6 +84,46 @@ do
   files["/roles/scout.lua"] = "return { name='scout2' }"
   local _, ver3 = fw.build("scout")
   check("changed source bumps version", ver3 == 2, ver3)
+end
+
+-- gps triangulation ---------------------------------------------------------
+
+do
+  -- true offset: universal = deviceRaw + offset. Device frame = universal - offset.
+  local trueOff = { x = 1000, y = 0, z = -2000 }
+  local devUniversal = { x = 50, y = 64, z = 50 }
+  local raw = { x = devUniversal.x - trueOff.x, y = devUniversal.y - trueOff.y, z = devUniversal.z - trueOff.z }
+  local wps = { { x = 60, y = 64, z = 50 }, { x = 50, y = 70, z = 40 }, { x = 80, y = 64, z = 80 } }
+  local sightings, known = {}, {}
+  for i, w in ipairs(wps) do
+    local key = 1000 + i
+    known[key] = w
+    -- findWaypoints returns the waypoint relative to the device (frame-invariant)
+    sightings[#sightings + 1] = { key = key,
+      rel = { x = w.x - devUniversal.x, y = w.y - devUniversal.y, z = w.z - devUniversal.z } }
+  end
+  local off, n, spread = gpsfix.solve(raw, sightings, known)
+  check("gpsfix recovers offset", off and off.x == trueOff.x and off.y == trueOff.y and off.z == trueOff.z,
+    off and (off.x .. "," .. off.y .. "," .. off.z))
+  check("gpsfix triangulated 3 refs, zero spread", n == 3 and spread == 0)
+  local uni = gpsfix.toUniversal(raw, off)
+  check("gpsfix raw->universal", uni.x == devUniversal.x and uni.z == devUniversal.z)
+  check("gpsfix no known match -> nil", gpsfix.solve(raw, { { key = 999, rel = { x = 0, y = 0, z = 0 } } }, known) == nil)
+end
+
+-- grant + calib codecs ------------------------------------------------------
+
+do
+  local mode, area, ttl = hxnet.parse.grant(
+    hxnet.pack.grant(hxnet.MODE.DESTRUCTION, { x1 = 0, z1 = 0, x2 = 15, z2 = 15, y1 = 10, y2 = 40 }, 300))
+  check("grant roundtrip", mode == hxnet.MODE.DESTRUCTION and area.x2 == 15 and area.y1 == 10 and ttl == 300)
+  local raw, sights = hxnet.parse.calib(hxnet.pack.calib({ x = 1, y = 2, z = 3 },
+    { { key = 42, rel = { x = 5, y = 6, z = 7 } } }))
+  check("calib codec roundtrip", raw.x == 1 and #sights == 1 and sights[1].key == 42 and sights[1].rel.z == 7)
+  local off = hxnet.parse.caloff(hxnet.pack.caloff({ x = -100, y = 0, z = 200 }))
+  check("caloff roundtrip", off.x == -100 and off.z == 200)
+  check("hashAddr deterministic", hxnet.hashAddr("abc") == hxnet.hashAddr("abc")
+    and hxnet.hashAddr("abc") ~= hxnet.hashAddr("abd"))
 end
 
 -- registry ----------------------------------------------------------------

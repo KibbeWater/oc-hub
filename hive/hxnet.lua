@@ -60,13 +60,30 @@ hxnet.EVT = {
   NO_LAND = 5, NAV_FAIL = 6, GEOFENCE_REJ = 7, DRIFT = 8, DONE = 9, FAILED = 10,
   -- bulk uploads ride the EVT detail field (no extra verbs needed):
   SCAN = 20, CORRIDOR_ADD = 21,
+  -- coverage + authorization notices:
+  DEPART = 22, RETURN = 23, UNAUTH = 24,
+  -- position triangulation request (device -> queen):
+  CALIB = 25,
 }
 
 -- CMD opcodes (queen -> device control, carried in a signed CMD frame).
 hxnet.CMD = {
   NAV_ROUTE = 1, NAV_CANCEL = 2, ASSIGN = 3, ABORT = 4, RECALL = 5,
-  REBOOT = 6, PAUSE = 7, RESUME = 8, LOCATE = 9, DOCK = 10,
+  REBOOT = 6, PAUSE = 7, RESUME = 8, LOCATE = 9, DOCK = 10, GRANT = 11, CALIB = 12,
 }
+
+-- djb2 hash of a component address -> u32, so waypoint sightings can be matched
+-- between a device and the queen without shipping full UUID strings.
+function hxnet.hashAddr(s)
+  local h = 5381
+  for i = 1, #s do h = ((h * 33) + s:byte(i)) & 0xffffffff end
+  return h
+end
+
+-- Operating modes a device must be authorized for. SCOUT = observe/scan only;
+-- DESTRUCTION = may break blocks (mining); TRANSPORT = move items; FARM/BUILD as
+-- named. A device refuses block-modifying actions without a matching grant.
+hxnet.MODE = { NONE = 0, SCOUT = 1, DESTRUCTION = 2, TRANSPORT = 3, FARM = 4, BUILD = 5 }
 
 -- Device run states (reported in TELEM/PONG).
 hxnet.STATE = {
@@ -200,6 +217,46 @@ end
 
 function hxnet.pack.announce(role, ver) return string.pack("<BI2", role or 0, ver or 0) end
 function hxnet.parse.announce(b) return string.unpack("<BI2", b) end
+
+-- Authorization grant: operating mode + area bbox (x/z and a y-range) + ttl (s,
+-- 0 = until revoked). Carried by CMD.GRANT and appended to CMD.ASSIGN payloads.
+function hxnet.pack.grant(mode, a, ttl)
+  return string.pack("<Bi2i2i2i2i2i2I2", mode, a.x1, a.z1, a.x2, a.z2,
+    a.y1 or -32768, a.y2 or 32767, ttl or 0)
+end
+function hxnet.parse.grant(b)
+  local mode, x1, z1, x2, z2, y1, y2, ttl = string.unpack("<Bi2i2i2i2i2i2I2", b)
+  return mode, { x1 = x1, z1 = z1, x2 = x2, z2 = z2, y1 = y1, y2 = y2 }, ttl
+end
+hxnet.GRANT_LEN = 15
+
+-- Calibration request: device raw fix + the waypoints it sees (addr-hash + the
+-- position of the waypoint relative to the device). The queen solves a universal
+-- frame offset from these.
+function hxnet.pack.calib(raw, sightings)
+  local parts = { string.pack("<i2i2i2B", raw.x, raw.y, raw.z, #sightings) }
+  for _, s in ipairs(sightings) do
+    parts[#parts + 1] = string.pack("<I4i2i2i2", s.key, s.rel.x, s.rel.y, s.rel.z)
+  end
+  return table.concat(parts)
+end
+function hxnet.parse.calib(b)
+  local x, y, z, n, pos = string.unpack("<i2i2i2B", b)
+  local sightings = {}
+  for _ = 1, n do
+    local key, rx, ry, rz
+    key, rx, ry, rz, pos = string.unpack("<I4i2i2i2", b, pos)
+    sightings[#sightings + 1] = { key = key, rel = { x = rx, y = ry, z = rz } }
+  end
+  return { x = x, y = y, z = z }, sightings
+end
+
+-- Calibration result: the universal-frame offset to add to the device's raw fix.
+function hxnet.pack.caloff(off) return string.pack("<i2i2i2", off.x, off.y, off.z) end
+function hxnet.parse.caloff(b)
+  local x, y, z = string.unpack("<i2i2i2", b)
+  return { x = x, y = y, z = z }
+end
 
 function hxnet.pack.fwreq(stage, role, haveVer)
   return string.pack("<BBI2", stage or 0, role or 0, haveVer or 0)

@@ -14,8 +14,22 @@ local EFLAG = { TRUSTED = 1, SUSPECT = 2 }
 navgraph.KIND = KIND
 navgraph.MODE = MODE
 
-local NODE_FMT = "<I2Bi2Bi2BB"  -- id, kind, x, y, z, flags, rsv  (10 bytes)
-local EDGE_FMT = "<I2I2BI2BBI2B" -- a, b, mode, cost(0.1blk), trav, fails, lastOkH, flags (12)
+-- Tunnel/shaft types: clearance (w x h, blocks) and throughput capacity (how many
+-- devices may hold the edge at once). Holes are 3x3 vertical shafts shared by
+-- several devices ascending/descending; trunks are the high-capacity arteries.
+local TTYPE = { CRAWL = 1, STANDARD = 2, HIGHWAY = 3, TRUNK = 4, HOLE3 = 5 }
+local SPEC = {
+  [1] = { name = "crawl", w = 1, h = 2, cap = 1 },
+  [2] = { name = "standard", w = 2, h = 3, cap = 1 },
+  [3] = { name = "highway", w = 3, h = 3, cap = 2 },
+  [4] = { name = "trunk", w = 3, h = 4, cap = 3 },
+  [5] = { name = "hole3", w = 3, h = 3, cap = 3 },
+}
+navgraph.TTYPE = TTYPE
+navgraph.SPEC = SPEC
+
+local NODE_FMT = "<I2Bi2Bi2BI4"    -- id, kind, x, y, z, flags, addrHash  (13 bytes)
+local EDGE_FMT = "<I2I2BI2BBI2BB"  -- a, b, mode, cost, trav, fails, lastOkH, flags, ttype (13)
 
 local function dist3(a, b)
   local dx, dy, dz = a.x - b.x, (a.y or 0) - (b.y or 0), a.z - b.z
@@ -56,8 +70,18 @@ function navgraph.new(opts)
     local id = nextNode
     nextNode = nextNode + 1
     nodes[id] = { id = id, kind = spec.kind, x = spec.x, y = spec.y or 0, z = spec.z,
-      flags = spec.flags or 0, label = spec.label }
+      flags = spec.flags or 0, label = spec.label, addr = spec.addr or 0 }
     return id
+  end
+
+  -- Universal-frame references for triangulation: addrHash -> {x,y,z} for every
+  -- node that carries a waypoint address (the queen frame is the universal frame).
+  function self.calRefs()
+    local refs = {}
+    for _, nd in pairs(nodes) do
+      if nd.addr and nd.addr ~= 0 then refs[nd.addr] = { x = nd.x, y = nd.y, z = nd.z } end
+    end
+    return refs
   end
 
   function self.getNode(id) return nodes[id] end
@@ -65,12 +89,13 @@ function navgraph.new(opts)
   function self.edges() return edges end
 
   -- Create or extend an edge between two nodes. Re-linking merges the mode mask
-  -- and keeps the cheaper cost.
-  function self.link(a, b, mode, cost)
+  -- and keeps the cheaper cost. ttype sets the clearance/throughput class.
+  function self.link(a, b, mode, cost, ttype)
     for eid, e in pairs(edges) do
       if (e.a == a and e.b == b) or (e.a == b and e.b == a) then
         e.mode = e.mode | (mode or MODE.SURFACE)
         if cost and cost < e.cost then e.cost = cost end
+        if ttype then e.ttype = ttype end
         return eid
       end
     end
@@ -78,9 +103,21 @@ function navgraph.new(opts)
     nextEdge = nextEdge + 1
     local c = cost or math.floor(dist3(nodes[a], nodes[b]) * 10)
     edges[id] = { a = a, b = b, mode = mode or MODE.SURFACE, cost = c,
-      trav = 0, fails = 0, lastOk = 0, flags = 0 }
+      trav = 0, fails = 0, lastOk = 0, flags = 0, ttype = ttype or TTYPE.STANDARD }
     addAdj(id, edges[id])
     return id
+  end
+
+  -- A "hole": a 3x3 vertical shaft between yTop and yBot at (x,z). Multiple devices
+  -- can share it (capacity from the hole's type), so it serves as a network entry.
+  -- Returns topId, botId, edgeId.
+  function self.addHole(spec)
+    local topId = self.addNode{ kind = KIND.SHAFT_TOP, x = spec.x, y = spec.yTop, z = spec.z,
+      label = spec.label, addr = spec.addr }
+    local botId = self.addNode{ kind = KIND.SHAFT_BOT, x = spec.x, y = spec.yBot, z = spec.z }
+    local ttype = spec.ttype or TTYPE.HOLE3
+    local eid = self.link(topId, botId, MODE.SHAFT, math.abs(spec.yTop - spec.yBot) * 10, ttype)
+    return topId, botId, eid
   end
 
   -- Record a traversal outcome. Clean traversals promote to TRUSTED; blocks demote.
@@ -115,14 +152,31 @@ function navgraph.new(opts)
     leases[edgeId] = nil
   end
 
-  -- Effective routing cost: trusted edges are cheaper, suspect ones dearer, and
-  -- an active lease held by someone else makes the edge expensive (route around).
+  local function capOf(e)
+    local s = SPEC[e.ttype or TTYPE.STANDARD]
+    return s and s.cap or 1
+  end
+  -- Count current lease holders on an edge, pruning expired ones.
+  local function holders(edgeId, t)
+    local L = leases[edgeId]
+    if not L then return 0 end
+    local n = 0
+    for d, u in pairs(L) do
+      if u > t then n = n + 1 else L[d] = nil end
+    end
+    return n
+  end
+
+  -- Effective routing cost: trusted edges cheaper, suspect dearer, and an edge at
+  -- its throughput capacity (all lanes taken by others) is expensive so routing
+  -- prefers a less-congested path.
   local function edgeCost(e, edgeId, forDevice, t)
     local c = e.cost
     if (e.flags & EFLAG.TRUSTED) ~= 0 then c = math.floor(c * 0.7) end
     if (e.flags & EFLAG.SUSPECT) ~= 0 then c = c * 4 end
     local L = leases[edgeId]
-    if L and L.until_ > t and L.device ~= forDevice then c = c * 8 end
+    local mine = L and L[forDevice] and L[forDevice] > t
+    if not mine and holders(edgeId, t) >= capOf(e) then c = c * 8 end
     return c
   end
 
@@ -176,21 +230,39 @@ function navgraph.new(opts)
     return bestId, bestD
   end
 
-  -- Single-track lease over a tunnel edge.
+  function self.capacity(edgeId)
+    local e = edges[edgeId]
+    return e and capOf(e) or 0
+  end
+
+  -- Lease a lane on an edge. Grants (or renews) while holders < capacity, so a
+  -- highway/trunk/hole carries several devices at once; a crawl/standard is single-track.
   function self.lease(edgeId, device, ttl)
+    local e = edges[edgeId]
+    if not e then return false end
     local t = now()
-    local L = leases[edgeId]
-    if L and L.until_ > t and L.device ~= device then return false end
-    leases[edgeId] = { device = device, until_ = t + (ttl or 30) }
+    local L = leases[edgeId] or {}
+    leases[edgeId] = L
+    if L[device] and L[device] > t then L[device] = t + (ttl or 30); return true end
+    if holders(edgeId, t) >= capOf(e) then return false end
+    L[device] = t + (ttl or 30)
     return true
   end
+  -- Current lease holders (device ids) on an edge.
   function self.leased(edgeId)
-    local L = leases[edgeId]
-    return L and L.until_ > now() and L.device or nil
+    local t, out, L = now(), {}, leases[edgeId]
+    if L then for d, u in pairs(L) do if u > t then out[#out + 1] = d end end end
+    return out
+  end
+  function self.freeLanes(edgeId)
+    local e = edges[edgeId]
+    if not e then return 0 end
+    return capOf(e) - holders(edgeId, now())
   end
   function self.release(edgeId, device)
     local L = leases[edgeId]
-    if L and (not device or L.device == device) then leases[edgeId] = nil end
+    if not L then return end
+    if device then L[device] = nil else leases[edgeId] = nil end
   end
 
   -- --- persistence / wire --------------------------------------------------
@@ -202,12 +274,13 @@ function navgraph.new(opts)
     for _ in pairs(edges) do ec = ec + 1 end
     parts[#parts + 1] = string.pack("<I2I2", nc, ec)
     for id, nd in pairs(nodes) do
-      parts[#parts + 1] = string.pack(NODE_FMT, id, nd.kind, nd.x, nd.y, nd.z, nd.flags, 0)
+      parts[#parts + 1] = string.pack(NODE_FMT, id, nd.kind, nd.x, nd.y, nd.z, nd.flags, nd.addr or 0)
       parts[#parts + 1] = string.pack("<s2", nd.label or "")
     end
     for id, e in pairs(edges) do
       parts[#parts + 1] = string.pack("<I2", id)
-        .. string.pack(EDGE_FMT, e.a, e.b, e.mode, e.cost, e.trav, e.fails, e.lastOk, e.flags)
+        .. string.pack(EDGE_FMT, e.a, e.b, e.mode, e.cost, e.trav, e.fails, e.lastOk, e.flags,
+          e.ttype or TTYPE.STANDARD)
     end
     return table.concat(parts)
   end
@@ -219,20 +292,20 @@ function navgraph.new(opts)
     local nc, ec
     nc, ec, pos = string.unpack("<I2I2", blob, pos)
     for _ = 1, nc do
-      local id, kind, x, y, z, flags
-      id, kind, x, y, z, flags, _, pos = string.unpack(NODE_FMT, blob, pos)
+      local id, kind, x, y, z, flags, addr
+      id, kind, x, y, z, flags, addr, pos = string.unpack(NODE_FMT, blob, pos)
       local label
       label, pos = string.unpack("<s2", blob, pos)
       nodes[id] = { id = id, kind = kind, x = x, y = y, z = z, flags = flags,
-        label = (#label > 0) and label or nil }
+        addr = addr, label = (#label > 0) and label or nil }
     end
     for _ = 1, ec do
       local id
       id, pos = string.unpack("<I2", blob, pos)
-      local a, b, mode, cost, trav, fails, lastOk, flags
-      a, b, mode, cost, trav, fails, lastOk, flags, pos = string.unpack(EDGE_FMT, blob, pos)
+      local a, b, mode, cost, trav, fails, lastOk, flags, ttype
+      a, b, mode, cost, trav, fails, lastOk, flags, ttype, pos = string.unpack(EDGE_FMT, blob, pos)
       edges[id] = { a = a, b = b, mode = mode, cost = cost, trav = trav,
-        fails = fails, lastOk = lastOk, flags = flags }
+        fails = fails, lastOk = lastOk, flags = flags, ttype = ttype }
       addAdj(id, edges[id])
     end
   end

@@ -25,10 +25,33 @@ if hxnet.VERSION ~= 1 then
 end
 local netshim = require("hive.core.netshim")
 local navgraphLib = require("hive.core.navgraph")
+local gpsfix = require("hive.core.gpsfix")
 local boot = require("hive.core.bootstrap")
 local shared = require("hive.core.shared")
 
+local SAFEZONE_Y = 16 -- mining must stay this many blocks below the surface
+
+local droneSdk = require("hive.sdk.drone_sdk")
+local robotSdk = require("hive.sdk.robot_sdk")
+
 local ROLE_NAME = { [1] = "scout", [2] = "relay", [3] = "miner", [4] = "courier", [5] = "farmer" }
+
+-- Bundle the operating grant (mode + area, incl. the mining Y-range) with an
+-- assignment, so the device can only act where and how the queen authorized.
+local function encodeAssignment(d, task)
+  local p = task.params or {}
+  if task.type == "mine_slab" then
+    local area = { x1 = p.x1, z1 = p.z1, x2 = p.x2, z2 = p.z2, y1 = p.y1, y2 = p.y2 }
+    return robotSdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.DESTRUCTION, area, 600)
+  elseif task.type == "mine_vein" then
+    local area = { x1 = p.x - 8, z1 = p.z - 8, x2 = p.x + 8, z2 = p.z + 8, y1 = p.y - 8, y2 = p.y + 8 }
+    return robotSdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.DESTRUCTION, area, 600)
+  end
+  -- scan_tile (drone): SCOUT over the whole tile column
+  local cx, cz = p.cx or 0, p.cz or 0
+  local area = { x1 = cx * 16, z1 = cz * 16, x2 = cx * 16 + 15, z2 = cz * 16 + 15 }
+  return droneSdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.SCOUT, area, 600)
+end
 
 local function dataCard()
   if not component.isAvailable("data") then
@@ -117,6 +140,17 @@ local function cmdRun()
     elseif e.subcode == hxnet.EVT.SCAN then
       svc.worlddb.ingest(e.detail)
       svc.routes.onIngest()
+    elseif e.subcode == hxnet.EVT.CALIB then
+      local raw, sightings = hxnet.parse.calib(e.detail)
+      local off, n, spread = gpsfix.solve(raw, sightings, svc.navgraph.calRefs())
+      if off and (not spread or spread <= 2) then
+        net.cmd(id, hxnet.CMD.CALIB, hxnet.pack.caloff(off))
+        svc.log.info("device %d calibrated (%d refs, spread %d)", id, n, spread or 0)
+      end
+    elseif e.subcode == hxnet.EVT.DEPART then
+      svc.log.info("device %d left the signaled area", id)
+    elseif e.subcode == hxnet.EVT.UNAUTH then
+      svc.log.alert("device %d attempted an unauthorized action", id)
     end
   end)
 
@@ -140,25 +174,29 @@ local function cmdRun()
     if t - lastSweep >= 5 then
       for _, id in ipairs(svc.registry.sweep()) do svc.tasker.onLost(id) end
       svc.tasker.sweep()
-      -- assign queued work to idle devices
+      svc.poi.sweepChargers()
+      -- assign queued work to idle devices, bundling the operating grant with it
       for id, d in pairs(svc.registry.all()) do
-        if d.state == "idle" or d.state == 1 then
+        if d.state == "idle" or d.state == hxnet.STATE.IDLE then
           local task = svc.tasker.assignTo({ id = id, caps = d.caps or {}, pos = d.pos or o,
             energy = d.energy or 1 })
-          if task then svc.registry.setTask(id, task.id) end
+          if task then
+            svc.registry.setTask(id, task.id)
+            net.cmd(id, hxnet.CMD.ASSIGN, encodeAssignment(d, task))
+          end
         end
       end
       lastSweep = t
     end
     svc.routes.tick(30)
     if t - lastSave >= 30 then
-      svc.registry.save(); svc.worlddb.flush(); svc.navgraph.save()
+      svc.registry.save(); svc.worlddb.flush(); svc.navgraph.save(); svc.poi.save()
       if svc.tasker.journalSize() > 65536 then svc.tasker.checkpoint() end
       lastSave = t
     end
   end
 
-  svc.registry.save(); svc.worlddb.flush(); svc.navgraph.save(); svc.tasker.checkpoint()
+  svc.registry.save(); svc.worlddb.flush(); svc.navgraph.save(); svc.poi.save(); svc.tasker.checkpoint()
   shared.svc, shared.net = nil, nil
   svc.log.info("hived stopped")
 end
@@ -196,23 +234,64 @@ local function cmdSurvey()
       local kind = navgraphLib.KIND.WAYPOINT
       if label:match("^hx:cr?:") then kind = navgraphLib.KIND.CHARGER
       elseif label:match("^hx:d:") then kind = navgraphLib.KIND.DEPOT end
-      svc.navgraph.addNode{ kind = kind, x = (px or 0) + w.position[1],
-        y = (py or 0) + w.position[2], z = (pz or 0) + w.position[3], label = label }
+      local wp = { x = (px or 0) + w.position[1], y = (py or 0) + w.position[2],
+        z = (pz or 0) + w.position[3] }
+      svc.navgraph.addNode{ kind = kind, x = wp.x, y = wp.y, z = wp.z, label = label,
+        addr = hxnet.hashAddr(w.address or label) }
+      -- also register chargers/depots as POIs for reservations + the dashboard
+      local poiKind = ({ [navgraphLib.KIND.CHARGER] = label:match("^hx:cr:") and "charger_robot" or "charger_drone",
+        [navgraphLib.KIND.DEPOT] = "depot" })[kind] or "waypoint"
+      svc.poi.add{ kind = poiKind, pos = wp, label = label, active = (w.redstone or 0) == 0 or true }
       added = added + 1
     end
   end
-  svc.navgraph.save()
+  svc.navgraph.save(); svc.poi.save()
   print(string.format("Surveyed %d hx: waypoint(s).", added))
+end
+
+-- --- queue work ------------------------------------------------------------
+
+local function svcHandle()
+  return shared.svc or boot.bringUp(boot.loadConfig())
+end
+
+local function cmdScan(a)
+  local svc = svcHandle()
+  local x1, z1, x2, z2 = tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), tonumber(a[5])
+  if not (x1 and z1 and x2 and z2) then print("usage: hived scan <x1> <z1> <x2> <z2>"); return end
+  local leaves = svc.tasker.submit{ type = "scan_area", params = { x1 = x1, z1 = z1, x2 = x2, z2 = z2 } }
+  if not shared.svc then svc.tasker.checkpoint() end
+  print(("Queued %d scan tile(s)."):format(#leaves))
+end
+
+local function cmdMine(a)
+  local svc = svcHandle()
+  local x1, y1, z1, x2, y2, z2 = tonumber(a[2]), tonumber(a[3]), tonumber(a[4]),
+    tonumber(a[5]), tonumber(a[6]), tonumber(a[7])
+  if not (x1 and y1 and z1 and x2 and y2 and z2) then
+    print("usage: hived mine <x1> <y1> <z1> <x2> <y2> <z2>"); return
+  end
+  local leaves = svc.tasker.submit{ type = "mine_region",
+    params = { x1 = x1, y1 = y1, z1 = z1, x2 = x2, y2 = y2, z2 = z2 } }
+  if not shared.svc then svc.tasker.checkpoint() end
+  if #leaves == 0 then
+    print("No slabs queued -- the area is unscanned or entirely inside the 16-block surface safezone.")
+  else
+    print(("Queued %d mining slab(s) (clamped to keep 16 blocks below the surface)."):format(#leaves))
+  end
 end
 
 -- --- dispatch --------------------------------------------------------------
 
-local cmd = ({ ... })[1]
+local args = { ... }
+local cmd = args[1]
 if cmd == "init" then cmdInit()
 elseif cmd == "run" then cmdRun()
 elseif cmd == "status" then cmdStatus()
 elseif cmd == "survey" then cmdSurvey()
+elseif cmd == "scan" then cmdScan(args)
+elseif cmd == "mine" then cmdMine(args)
 else
   print("hived - hive queen daemon")
-  print("usage: hived init | run | status | survey")
+  print("usage: hived init | run | status | survey | scan <x1 z1 x2 z2> | mine <x1 y1 z1 x2 y2 z2>")
 end

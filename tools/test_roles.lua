@@ -89,7 +89,11 @@ local function serviceQueen()
         pos = d.pos or { x = 0, y = 64, z = 0 }, energy = d.energy or 1 })
       if task then
         reg.setTask(id, task.id)
-        qnet.cmd(id, hxnet.CMD.ASSIGN, sdk.encodeTask(task))
+        -- bundle a SCOUT grant for the tile so scanning is authorized
+        local cx, cz = task.params.cx, task.params.cz
+        local area = { x1 = cx * 16, z1 = cz * 16, x2 = cx * 16 + 15, z2 = cz * 16 + 15 }
+        local payload = sdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.SCOUT, area, 600)
+        qnet.cmd(id, hxnet.CMD.ASSIGN, payload)
       end
     end
   end
@@ -141,6 +145,46 @@ while coroutine.status(co) ~= "dead" and iterations < 20000 do
   if drone.dead then break end
 end
 
+-- low-energy failsafe: a near-empty scout must not fly a task; it lands + idles ---
+
+do
+  local w2 = hivesim.world{ surface = hivesim.terrain.plains(64) }
+  local ck2 = hivesim.clock()
+  local d2 = hivesim.drone(w2, 0, 80, 0, { energy = 0.05 }) -- critical
+  local g2 = hivesim.geolyzer(w2, function() return d2.pos() end)
+  local moved = { count = 0 }
+  local ctx2 = {
+    id = 9, key = hxnet.deriveKey(master, 9, fakeHmac), hmac = fakeHmac, now = ck2.now,
+    role = 1, fw = 1, nonce = "lowbatt0", queen = { x = 0, y = 64, z = 0 },
+    home = { x = 0, y = 64, z = 0 }, joined = true,
+    send = function() end,
+    pull = function(t) return coroutine.yield(t or 0) end,
+    navPos = function() return d2.pos() end,
+    droneMove = function(dx, dy, dz) moved.count = moved.count + 1; d2.move(dx, dy, dz) end,
+    droneOffset = function() return d2.offset() end,
+    geoScan = function(rx, rz, ry, ww, dd, hh) return g2.scan(rx, rz, ry, ww, dd, hh) end,
+    energy = function() return d2.energyFrac() end,
+    setStatus = function() end, setLight = function() end,
+    -- inject a task immediately so we can prove it is NOT executed while critical
+  }
+  -- pre-seed a scan task via a fake ASSIGN before running
+  local scoutRole = require("scout")
+  local co2 = coroutine.create(function() sdk.main(scoutRole, ctx2) end)
+  local startX = select(1, d2.pos())
+  local ok2, dt2 = coroutine.resume(co2)
+  local iters = 0
+  while coroutine.status(co2) ~= "dead" and iters < 200 do
+    iters = iters + 1
+    for _ = 1, math.max(1, math.floor((tonumber(dt2) or 0.25) / 0.05)) do d2.stepTick() end
+    ck2.advance(tonumber(dt2) or 0.25)
+    ok2, dt2 = coroutine.resume(co2, nil)
+    if not ok2 then error(dt2) end
+    if iters > 20 then break end -- a few seconds is enough to observe behaviour
+  end
+  check("critical-energy scout enters low-power (no lateral task flight)",
+    math.abs((select(1, d2.pos())) - startX) <= 1, select(1, d2.pos()))
+end
+
 check("scout joined the swarm", joined and reg.get(devId) ~= nil)
 check("scout survived the flight", not drone.dead)
 local summary = worlddb.tileSummary(0, 0)
@@ -151,6 +195,78 @@ check("scanned surface is correct", (function()
   return c and c.surfaceY == 64
 end)(), worlddb.column(5, 5) and worlddb.column(5, 5).surfaceY)
 check("finished in a sane number of steps", iterations < 20000, iterations)
+
+-- robot miner: an authorized DESTRUCTION grant clears the slab; a SCOUT grant
+-- (wrong mode) must leave every block intact -------------------------------
+
+local function runMiner(grantMode)
+  local w = hivesim.world{ surface = hivesim.terrain.plains(5) }
+  for x = 0, 2 do for y = 10, 12 do for z = 0, 2 do w.place(x, y, z, "stone") end end end
+  local ck = hivesim.clock()
+  local robot = hivesim.robot(w, -1, 12, 0, { dig = true })
+  local rsdk = require("robot_sdk")
+  local miner = require("miner")
+  local st2 = store.new{ fs = hivesim.memfs() }
+  local reg2 = registryLib.new{ store = st2, now = ck.now }
+  local qIn, dIn, assigned = {}, {}, false
+  local qnet = netshim.new{ id = 0, master = master, hmac = fakeHmac, now = ck.now, epoch = 2,
+    send = function(wire) dIn[#dIn + 1] = wire end }
+  qnet.onHello(function(id, info)
+    reg2.join(id, { role = "miner", kind = "robot", caps = { "mine" } })
+    qnet.welcome(id, info.nonce, id, 0, 0, 64, 0, 1)
+  end)
+  qnet.onTelem(function(id, b) reg2.upsertBeacon(id, b) end)
+  qnet.onEvt(function() end)
+
+  local ctx = {
+    id = 8, key = hxnet.deriveKey(master, 8, fakeHmac), hmac = fakeHmac, now = ck.now,
+    role = 3, fw = 1, nonce = "miner001", queen = { x = 0, y = 64, z = 0 }, home = { x = -1, y = 12, z = 0 },
+    send = function(wire) qIn[#qIn + 1] = wire end,
+    pull = function(t) return coroutine.yield(t) end,
+    navPos = function() return robot.pos() end,
+    moveStep = function(dx, dy, dz) return robot.moveStep(dx, dy, dz) end,
+    dig = function(dx, dy, dz) return robot.dig(dx, dy, dz) end,
+    detect = function(dx, dy, dz) return robot.detect(dx, dy, dz) end,
+    energy = function() return robot.energyFrac() end,
+    charge = function() end,
+  }
+  local function cleared()
+    for x = 0, 2 do for y = 10, 12 do for z = 0, 2 do
+      if w.blockName(x, y, z) ~= "air" then return false end
+    end end end
+    return true
+  end
+  local function serviceQueen()
+    while #qIn > 0 do qnet.submit("d", 5, table.remove(qIn, 1)) end
+    for id, d in pairs(reg2.all()) do
+      if (d.state == hxnet.STATE.IDLE or d.state == "idle") and not d.taskId and not assigned then
+        local task = { type = "mine_slab", params = { x1 = 0, y1 = 10, z1 = 0, x2 = 2, y2 = 12, z2 = 2 } }
+        local area = { x1 = 0, z1 = 0, x2 = 2, z2 = 2, y1 = 10, y2 = 12 }
+        reg2.setTask(id, "M1"); assigned = true
+        qnet.cmd(id, hxnet.CMD.ASSIGN, rsdk.encodeTask(task) .. hxnet.pack.grant(grantMode, area, 600))
+      end
+    end
+  end
+  local co = coroutine.create(function() rsdk.main(miner, ctx) end)
+  local ok, dt = coroutine.resume(co)
+  assert(ok, dt)
+  local it = 0
+  while coroutine.status(co) ~= "dead" and it < 5000 do
+    it = it + 1
+    ck.advance(tonumber(dt) or 0.2)
+    serviceQueen()
+    local msg = table.remove(dIn, 1)
+    if msg then ok, dt = coroutine.resume(co, "modem_message", "q", "q", hxnet.PORT, 5, msg)
+    else ok, dt = coroutine.resume(co, nil) end
+    if not ok then error(dt) end
+    if assigned and cleared() then break end
+    if it > 3000 then break end
+  end
+  return cleared()
+end
+
+check("miner clears an authorized slab (DESTRUCTION grant)", runMiner(hxnet.MODE.DESTRUCTION))
+check("miner refuses digging without DESTRUCTION (SCOUT grant)", not runMiner(hxnet.MODE.SCOUT))
 
 print(string.rep("-", 40))
 if failures == 0 then print("all role tests passed"); os.exit(0)

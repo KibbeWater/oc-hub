@@ -103,6 +103,43 @@ local function deviceScreen(id)
   }
 end
 
+-- --- Tasks screen ----------------------------------------------------------
+
+local function taskList()
+  local rows = {}
+  for _, t in pairs(svc.tasker.all()) do
+    if not t.children then rows[#rows + 1] = t end -- leaves only
+  end
+  table.sort(rows, function(a, b) return tostring(a.id) < tostring(b.id) end)
+  return rows
+end
+
+local function taskScreen()
+  return {
+    build = function(self, n, u)
+      u:add(ocui.label{ x = 1, y = 1, w = u.w, fg = ocui.theme.accent, text = "Tasks" })
+      self.list = ocui.list{ x = 1, y = 3, w = u.w, h = u.h - 4, items = taskList(),
+        render = function(t)
+          local left = ("%s %-10s %-9s"):format(t.id, t.type, t.state)
+          local right = ("%d%%"):format(math.floor((t.progress and t.progress.pct or 0) * 100))
+          return left, right
+        end,
+        onSelect = function(_, t)
+          if t.state == "queued" or t.state == "assigned" or t.state == "active" then
+            svc.tasker.cancel(t.id)
+          elseif t.state == "failed" then
+            t.state = "queued"; t.assignee = nil; t.attempts = 0
+          end
+        end }
+      u:add(self.list)
+      u:add(ocui.label{ x = 1, y = u.h - 1, w = u.w, fg = ocui.theme.dim,
+        text = "tap: cancel active / requeue failed" })
+      u:add(ocui.button{ x = 1, y = u.h, text = "Back", onTap = function() n:pop() end })
+    end,
+    tick = function(self) if self.list then self.list:setItems(taskList()) end end,
+  }
+end
+
 -- --- Map screen ------------------------------------------------------------
 
 local function mapScreen()
@@ -177,9 +214,10 @@ local function fleetScreen()
         end,
         onSelect = function(_, item) n:push(deviceScreen(item.id)) end }
       u:add(self.list)
-      u:add(ocui.button{ x = 1, y = u.h, text = "Map", onTap = function() n:push(mapScreen()) end })
-      u:add(ocui.button{ x = 9, y = u.h, text = "Log", onTap = function() n:push(logScreen()) end })
-      u:add(ocui.button{ x = 17, y = u.h, text = "Quit", onTap = function() n.done = true end })
+      u:add(ocui.button{ x = 1, y = u.h, text = "Tasks", onTap = function() n:push(taskScreen()) end })
+      u:add(ocui.button{ x = 10, y = u.h, text = "Map", onTap = function() n:push(mapScreen()) end })
+      u:add(ocui.button{ x = 18, y = u.h, text = "Log", onTap = function() n:push(logScreen()) end })
+      u:add(ocui.button{ x = 26, y = u.h, text = "Quit", onTap = function() n.done = true end })
     end,
     tick = function(self)
       local total, online = svc.registry.count()

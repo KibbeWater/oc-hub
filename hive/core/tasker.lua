@@ -21,6 +21,8 @@ function tasker.new(opts)
   local logf = opts.log or function() end
   local idPrefix = opts.idPrefix or "T"
   local leaseSecs = opts.lease or DEFAULT_LEASE
+  local surfaceAt = opts.surfaceAt          -- optional (x,z)->surfaceY|nil for the safezone
+  local safezone = opts.safezone or 16      -- keep mining this far below the surface
   local snapPath = dir .. "/tasks.snapshot"
   local logPath = dir .. "/tasks.log"
   local journal = st.journal(logPath)
@@ -61,28 +63,40 @@ function tasker.new(opts)
       end
       return out
     elseif spec.type == "mine_region" then
+      -- Per 16x16 footprint, cap the top of mining at (min surface - safezone) so
+      -- we never break the crust; skip footprints over unscanned ground.
       local out = {}
       local xs, xe = math.min(p.x1, p.x2), math.max(p.x1, p.x2)
       local ys, ye = math.min(p.y1, p.y2), math.max(p.y1, p.y2)
       local zs, ze = math.min(p.z1, p.z2), math.max(p.z1, p.z2)
-      -- top-down 3-high slabs, 16x16 footprint.
-      local yTop = ye
-      while yTop >= ys do
-        local yBot = math.max(ys, yTop - 2)
-        for bx = xs, xe, 16 do
-          for bz = zs, ze, 16 do
-            local x2 = math.min(xe, bx + 15)
-            local z2 = math.min(ze, bz + 15)
-            -- checkerboard order key: even-parity footprints run first.
-            local parity = (fdiv(bx, 16) + fdiv(bz, 16)) % 2
+      for bx = xs, xe, 16 do
+        for bz = zs, ze, 16 do
+          local x2 = math.min(xe, bx + 15)
+          local z2 = math.min(ze, bz + 15)
+          local ceil = ye
+          if surfaceAt then
+            local minSurf
+            for x = bx, x2 do
+              for z = bz, z2 do
+                local s = surfaceAt(x, z)
+                if s then minSurf = math.min(minSurf or s, s) end
+              end
+            end
+            if not minSurf then ceil = nil -- unscanned: refuse to mine blind
+            else ceil = math.min(ye, minSurf - safezone) end
+          end
+          local parity = (fdiv(bx, 16) + fdiv(bz, 16)) % 2
+          local yTop = ceil
+          while yTop and yTop >= ys do
+            local yBot = math.max(ys, yTop - 2)
             out[#out + 1] = {
               type = "mine_slab", needs = { "mine" }, priority = pr,
               params = { x1 = bx, y1 = yBot, z1 = bz, x2 = x2, y2 = yTop, z2 = z2, parity = parity },
               startPos = { x = bx, y = yTop, z = bz },
             }
+            yTop = yBot - 1
           end
         end
-        yTop = yBot - 1
       end
       return out
     else

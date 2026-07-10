@@ -14,6 +14,7 @@ local taskerLib = require("hive.core.tasker")
 local worlddbLib = require("hive.core.worlddb")
 local routesLib = require("hive.core.routes")
 local navgraphLib = require("hive.core.navgraph")
+local poiLib = require("hive.core.poi")
 local firmwareLib = require("hive.core.firmware")
 local logLib = require("hive.core.log")
 local optimize = require("optimize")
@@ -83,14 +84,18 @@ function bootstrap.bringUp(cfg)
   local registry = registryLib.new{ store = store, now = now, log = log.info,
     path = bootstrap.STATE_DIR .. "/fleet.db" }
   registry.load()
-  local tasker = taskerLib.new{ store = store, now = now, log = log.info, dir = bootstrap.STATE_DIR }
-  tasker.load()
   local worlddb = worlddbLib.new{ store = store, roots = cfg.worldRoots, now = now,
     indexPath = cfg.worldRoots[1] .. "/index.db",
     mkdir = function(p) if not fs.exists(p) then fs.makeDirectory(p) end end }
+  local tasker = taskerLib.new{ store = store, now = now, log = log.info, dir = bootstrap.STATE_DIR,
+    surfaceAt = function(x, z) local c = worlddb.column(x, z); return c and c.surfaceY end,
+    safezone = 16 }
+  tasker.load()
   local navgraph = navgraphLib.new{ store = store, now = now,
     path = bootstrap.STATE_DIR .. "/navgraph.db" }
   navgraph.load()
+  local poi = poiLib.new{ store = store, now = now, path = bootstrap.STATE_DIR .. "/poi.db" }
+  poi.load()
   local routes = routesLib.new{ now = now, clock = computer.uptime, graph = navgraph, env = {
     maxSurface = function(cx, cz) local s = worlddb.tileSummary(cx, cz); return s and s.maxSurface end,
     surface = function(x, z) local c = worlddb.column(x, z); return c and c.surfaceY end,
@@ -100,7 +105,7 @@ function bootstrap.bringUp(cfg)
 
   return { store = store, log = log, master = master, epoch = epoch, cfg = cfg,
     registry = registry, tasker = tasker, worlddb = worlddb, navgraph = navgraph,
-    routes = routes, firmware = firmware }
+    poi = poi, routes = routes, firmware = firmware }
 end
 
 return bootstrap

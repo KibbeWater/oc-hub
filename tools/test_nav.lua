@@ -246,6 +246,44 @@ do
   check("navgraph pack/unpack preserves labels", g2.getNode(a).label == "hx:c:base")
 end
 
+-- tunnel types + capacity leases + holes ----------------------------------
+
+do
+  local g = navgraph.new{ now = function() return 0 end }
+  local a = g.addNode{ kind = navgraph.KIND.JUNCTION, x = 0, y = 30, z = 0 }
+  local b = g.addNode{ kind = navgraph.KIND.JUNCTION, x = 50, y = 30, z = 0 }
+  local hw = g.link(a, b, navgraph.MODE.TUNNEL, 500, navgraph.TTYPE.HIGHWAY)
+  check("highway capacity is 2", g.capacity(hw) == 2)
+  check("highway lane 1 leased", g.lease(hw, "r1", 30))
+  check("highway lane 2 leased", g.lease(hw, "r2", 30))
+  check("highway full rejects 3rd", g.lease(hw, "r3", 30) == false)
+  check("no free lanes when full", g.freeLanes(hw) == 0)
+  g.release(hw, "r1")
+  check("release frees a lane", g.freeLanes(hw) == 1)
+  check("freed lane re-leasable", g.lease(hw, "r3", 30))
+  check("leased lists two holders", #g.leased(hw) == 2)
+
+  -- crawl is single-track
+  local c = g.addNode{ kind = navgraph.KIND.JUNCTION, x = 50, y = 30, z = 50 }
+  local crawl = g.link(b, c, navgraph.MODE.TUNNEL, 400, navgraph.TTYPE.CRAWL)
+  check("crawl capacity 1", g.capacity(crawl) == 1)
+  check("crawl single-track", g.lease(crawl, "x", 30) and g.lease(crawl, "y", 30) == false)
+
+  -- hole: 3x3 vertical shaft, multi-device entry
+  local top, bot, he = g.addHole{ x = 10, z = 10, yTop = 64, yBot = 20 }
+  check("hole makes shaft nodes", g.getNode(top).kind == navgraph.KIND.SHAFT_TOP
+    and g.getNode(bot).kind == navgraph.KIND.SHAFT_BOT)
+  check("hole edge capacity 3", g.capacity(he) == 3)
+  local t2 = g.addHole{ x = 200, z = 0, yTop = 64, yBot = 30 } -- multiple entries
+  check("multiple holes supported", t2 ~= top)
+
+  -- ttype survives pack/unpack
+  local g2 = navgraph.new{ now = function() return 0 end }
+  g2.unpack(g.pack())
+  check("tunnel types survive pack/unpack", g2.capacity(hw) == 2 and g2.capacity(he) == 3
+    and g2.capacity(crawl) == 1)
+end
+
 -- obstacle overlay --------------------------------------------------------
 
 do
