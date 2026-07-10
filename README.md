@@ -276,6 +276,22 @@ Playback keys: `[space]` pause/resume, `[q]` stop. Downloads are cached in
 `/home/music/`. All NBS versions parse (classic v0 through OpenNBS v5),
 including tempo changers, per-note velocity and detune.
 
+### Keeping the fleet up to date
+
+Player nodes don't need internet cards: they only need `nbs.lua` and
+`noteplayer.lua` installed once (wget, or a floppy from the master). After
+that, `noteblock update` on the master broadcasts the master's own copies
+of both files to every listening daemon — nodes verify the code compiles,
+install it and reboot. So the update path for everything is:
+
+```
+ocgit pull /home/work && ocgit install /home/work   # master, from GitHub
+noteblock update                                    # master -> all nodes
+```
+
+Add `noteplayer` to each node's `/home/.shrc` so the daemon comes back up
+after the update reboot (and on any other restart).
+
 ### Getting the most out of ONE computer
 
 Each note block `trigger()` is a *synchronized* OpenComputers call — it

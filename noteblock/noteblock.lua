@@ -10,6 +10,10 @@
 --   noteblock play <target> [...]   play files/URLs/noteblock.world ids
 --   noteblock search <words...>     quick search
 --   noteblock players               list available player nodes
+--   noteblock update                push this computer's noteplayer files
+--                                   to every listening node (they install
+--                                   and reboot; only the master needs
+--                                   internet access)
 --   noteblock stop                  stop all nodes
 --
 -- Targets: /path/song.nbs | https://noteblock.world/song/<id> | <id> | any URL
@@ -632,6 +636,95 @@ local function browse()
   end
 end
 
+----------------------------------------------------------------- update --
+
+-- Broadcasts this computer's own noteplayer files to every listening
+-- node, which verifies, installs and reboots. So only the master ever
+-- needs internet access: 'ocgit pull && ocgit install' here, then
+-- 'noteblock update' ships it to the whole fleet.
+local UPDATE_FILES = {
+  "/usr/lib/nbs.lua",
+  "/usr/bin/noteplayer.lua",
+}
+
+local function commandUpdate()
+  local modem = openModem()
+  if not modem then fail("a network card is required") end
+
+  local bodies = {}
+  for i, path in ipairs(UPDATE_FILES) do
+    local f, err = io.open(path, "rb")
+    if not f then fail("cannot read " .. path .. ": " .. tostring(err)) end
+    bodies[i] = f:read("*a")
+    f:close()
+  end
+
+  local id = tostring(math.floor(computer.uptime() * 100))
+  modem.broadcast(port, PROTOCOL, "upd-begin", id, #UPDATE_FILES)
+  local chunkCounts = {}
+  for i, body in ipairs(bodies) do
+    chunkCounts[i] = math.ceil(#body / CHUNK)
+    modem.broadcast(port, PROTOCOL, "upd-file", id, i, UPDATE_FILES[i], chunkCounts[i])
+  end
+
+  local function sendChunk(index, seq)
+    modem.broadcast(port, PROTOCOL, "upd-chunk", id, index, seq,
+      bodies[index]:sub((seq - 1) * CHUNK + 1, seq * CHUNK))
+  end
+
+  for i = 1, #bodies do
+    for seq = 1, chunkCounts[i] do
+      sendChunk(i, seq)
+      if seq % 8 == 0 then os.sleep(0.05) end
+    end
+  end
+
+  local confirmed = {}
+  for _ = 1, 3 do
+    modem.broadcast(port, PROTOCOL, "upd-eof", id)
+    local resend = {}
+    local deadline = computer.uptime() + 3
+    while computer.uptime() < deadline do
+      local sig = table.pack(event.pull(
+        math.max(0.05, deadline - computer.uptime()), "modem_message"))
+      if sig[1] == "modem_message" and sig[4] == port and sig[6] == PROTOCOL then
+        if sig[7] == "upd-ok" and sig[8] == id then
+          confirmed[sig[3]] = true
+        elseif sig[7] == "upd-miss" and sig[8] == id then
+          confirmed[sig[3]] = nil
+          for index, seq in tostring(sig[9]):gmatch("(%d+):(%d+)") do
+            resend[index .. ":" .. seq] = true
+          end
+        end
+      end
+    end
+    if not next(resend) then break end
+    io.write("resending lost chunks... ")
+    for key in pairs(resend) do
+      local index, seq = key:match("(%d+):(%d+)")
+      index, seq = tonumber(index), tonumber(seq)
+      if seq == 0 then
+        -- node missed the file header entirely
+        modem.broadcast(port, PROTOCOL, "upd-file", id, index,
+          UPDATE_FILES[index], chunkCounts[index])
+        for s = 1, chunkCounts[index] do sendChunk(index, s) end
+      else
+        sendChunk(index, seq)
+      end
+      os.sleep(0.05)
+    end
+    print("done")
+  end
+
+  modem.broadcast(port, PROTOCOL, "upd-commit", id)
+  local count = 0
+  for _ in pairs(confirmed) do count = count + 1 end
+  printf("%d node(s) confirmed the update and are rebooting.", count)
+  if count == 0 then
+    print("(no daemons answered; are the nodes running 'noteplayer'?)")
+  end
+end
+
 ------------------------------------------------------------------- main --
 
 local command = args[1]
@@ -678,9 +771,11 @@ elseif command == "stop" then
   if not modem then fail("a network card is required") end
   modem.broadcast(port, PROTOCOL, "stop")
   print("stop broadcast sent")
+elseif command == "update" then
+  commandUpdate()
 elseif command == nil then
   browse()
 else
-  print("usage: noteblock [play <target>...|search <words>|players|stop]")
+  print("usage: noteblock [play <target>...|search <words>|players|update|stop]")
   os.exit(1)
 end

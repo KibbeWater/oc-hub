@@ -479,7 +479,53 @@ local function commandDaemon()
 
   local shareConfig = serialization.serialize(loadFullConfig() or config)
 
-  local function handleMessage(from, kind, a, b, c)
+  -- over-the-air update pushed by 'noteblock update' on the master
+  local update
+
+  local function updateMissing()
+    local missing = {}
+    for index = 1, update.total do
+      local file = update.files[index]
+      if not file then
+        missing[#missing + 1] = index .. ":0"
+      else
+        for seq = 1, file.count do
+          if not file.chunks[seq] then
+            missing[#missing + 1] = index .. ":" .. seq
+          end
+        end
+      end
+    end
+    return missing
+  end
+
+  local function installUpdate()
+    -- verify everything compiles before touching the disk
+    local contents = {}
+    for index = 1, update.total do
+      local file = update.files[index]
+      local body = table.concat(file.chunks, "", 1, file.count)
+      if file.path:match("%.lua$") and not load(body, "=update") then
+        printf("update rejected: %s does not compile", file.path)
+        return false
+      end
+      contents[index] = body
+    end
+    for index = 1, update.total do
+      local file = update.files[index]
+      local f, err = io.open(file.path, "wb")
+      if not f then
+        printf("update failed: cannot write %s: %s", file.path, tostring(err))
+        return false
+      end
+      f:write(contents[index])
+      f:close()
+      printf("updated %s (%d bytes)", file.path, #contents[index])
+    end
+    return true
+  end
+
+  local function handleMessage(from, kind, a, b, c, d)
     if kind == "discover" then
       modem.send(from, port, PROTOCOL, "hello", helloPayload)
     elseif kind == "getcal" then
@@ -527,6 +573,37 @@ local function commandDaemon()
       reset()
     elseif kind == "ping" then
       modem.send(from, port, PROTOCOL, "pong", state, songName or "")
+    elseif kind == "upd-begin" then
+      update = { master = from, id = a, total = tonumber(b) or 0, files = {} }
+      printf("receiving update from %s", from:sub(1, 8))
+    elseif kind == "upd-file" and update and from == update.master
+      and a == update.id then
+      update.files[tonumber(b)] = {
+        path = tostring(c),
+        count = tonumber(d) or 0,
+        chunks = {},
+      }
+    elseif kind == "upd-chunk" and update and from == update.master
+      and a == update.id then
+      local file = update.files[tonumber(b)]
+      if file then file.chunks[tonumber(c) or 0] = d end
+    elseif kind == "upd-eof" and update and from == update.master
+      and a == update.id then
+      local missing = updateMissing()
+      if #missing == 0 then
+        modem.send(from, port, PROTOCOL, "upd-ok", update.id)
+      else
+        modem.send(from, port, PROTOCOL, "upd-miss", update.id,
+          table.concat(missing, ","))
+      end
+    elseif kind == "upd-commit" and update and from == update.master
+      and a == update.id then
+      if #updateMissing() == 0 and installUpdate() then
+        print("update installed, rebooting...")
+        os.sleep(0.5)
+        computer.shutdown(true)
+      end
+      update = nil
     end
   end
 
@@ -547,7 +624,7 @@ local function commandDaemon()
 
       local sig = table.pack(event.pull(timeout))
       if sig[1] == "modem_message" and sig[4] == port and sig[6] == PROTOCOL then
-        handleMessage(sig[3], sig[7], sig[8], sig[9], sig[10])
+        handleMessage(sig[3], sig[7], sig[8], sig[9], sig[10], sig[11])
       end
 
       -- fire every action that is due
