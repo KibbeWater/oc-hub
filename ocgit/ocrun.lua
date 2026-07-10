@@ -16,6 +16,7 @@
 
 local component = require("component")
 local computer = require("computer")
+local event = require("event")
 local fs = require("filesystem")
 local internet = require("internet")
 local json = require("json")
@@ -183,6 +184,17 @@ end
 
 ---------------------------------------------------------------- main -----
 
+-- sleep that honors Ctrl+C (os.sleep swallows the soft interrupt)
+local function idle(seconds)
+  local deadline = computer.uptime() + seconds
+  repeat
+    if event.pull(math.max(0.05, deadline - computer.uptime())) == "interrupted" then
+      return false
+    end
+  until computer.uptime() >= deadline
+  return true
+end
+
 printf("ocrun: %s -> %s, script %s (Ctrl+C to stop)", base, dir, script)
 local ok, err = pcall(function()
   local changed, serr = syncOnce()
@@ -190,7 +202,7 @@ local ok, err = pcall(function()
   startScript()
   local announcedDead = false
   while true do
-    os.sleep(interval)
+    if not idle(interval) then break end
     local count, syncErr = syncOnce()
     if not count then
       printf("sync failed: %s", tostring(syncErr))

@@ -379,6 +379,10 @@ local function runPlayback(session)
       end
 
       local sig = table.pack(event.pull(timeout))
+      if sig[1] == "interrupted" then -- Ctrl+C stops like [q]
+        stopped = true
+        return
+      end
       if sig[1] == "key_down" then
         local char = sig[3]
         if char == 32 then -- space

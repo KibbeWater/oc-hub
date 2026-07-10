@@ -15,6 +15,7 @@
 
 local component = require("component")
 local computer = require("computer")
+local event = require("event")
 local fs = require("filesystem")
 local internet = require("internet")
 local json = require("json")
@@ -152,6 +153,17 @@ local function syncOnce()
   return changed
 end
 
+-- sleep that honors Ctrl+C (os.sleep swallows the soft interrupt)
+local function idle(seconds)
+  local deadline = computer.uptime() + seconds
+  repeat
+    if event.pull(math.max(0.05, deadline - computer.uptime())) == "interrupted" then
+      return false
+    end
+  until computer.uptime() >= deadline
+  return true
+end
+
 printf("syncing %s -> %s every %gs (Ctrl+C to stop)", base, dir, interval)
 local ok, err = pcall(function()
   while true do
@@ -163,7 +175,7 @@ local ok, err = pcall(function()
       os.execute(runCommand)
     end
     if opts.once then break end
-    os.sleep(interval)
+    if not idle(interval) then break end
   end
 end)
 if not ok and not tostring(err):match("interrupted") then

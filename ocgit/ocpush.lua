@@ -125,7 +125,8 @@ printf("watching %s on port %d (Ctrl+C to stop)", path, port)
 local last = fs.lastModified(path)
 local ok, err = pcall(function()
   while true do
-    local e = table.pack(event.pull(interval, "modem_message"))
+    local e = table.pack(event.pull(interval))
+    if e[1] == "interrupted" then break end -- Ctrl+C
     local wantPush = false
     if e[1] == "modem_message" and e[4] == port and e[6] == "ocnet:hello" then
       -- a node (re)booted; re-push unless we just did (debounce boot storms)

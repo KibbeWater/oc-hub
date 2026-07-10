@@ -623,6 +623,7 @@ local function commandDaemon()
       end
 
       local sig = table.pack(event.pull(timeout))
+      if sig[1] == "interrupted" then return end -- Ctrl+C
       if sig[1] == "modem_message" and sig[4] == port and sig[6] == PROTOCOL then
         handleMessage(sig[3], sig[7], sig[8], sig[9], sig[10], sig[11])
       end
