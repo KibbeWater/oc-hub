@@ -272,12 +272,18 @@ end
 -- opts.fallback: substitute an available instrument when no player has
 --                the required one (default true)
 -- opts.rsDelay:  the server's misc.redstoneDelay in seconds (default 0.1)
+-- opts.slack:    ticks a note may fire LATE before it is dropped
+--                (default 2). Since a machine gets exactly one
+--                synchronized call per tick, chords bigger than the
+--                machine count cannot be simultaneous; spilling the
+--                quieter notes a tick or two is far less audible than
+--                dropping them. 0 = strict on-time or drop.
 --
 -- Returns:
 --   assignments[playerIndex] = sorted list of
 --     {t=<seconds>, inst=<id>, p=<1-25>}           (trigger note)
 --     {t=<seconds>, volley=true, dev=<n>, mask=<0-63>}  (redstone volley)
---   stats   = { total, played, dropped, merged, substituted, bank }
+--   stats   = { total, played, dropped, merged, substituted, bank, late }
 --   tunings[playerIndex] = { {dev=<n>, side=<0-5>, pitch=<1-25>}, ... }
 --     (per-song pitches the player must set on its bank blocks first)
 function nbs.schedule(events, players, opts)
@@ -288,9 +294,10 @@ function nbs.schedule(events, players, opts)
   local TICK = 0.05
   local dynCost = TICK / perTick
   local volleyCost = TICK + rsDelay
+  local slack = (opts.slack or 2) * TICK
 
   local stats = { total = 0, played = 0, dropped = 0, merged = 0,
-    substituted = 0, bank = 0 }
+    substituted = 0, bank = 0, late = 0 }
   local assignments = {}
   local busyUntil = {} -- per player machine: earliest time it is free again
   local anyPlayers = {}
@@ -450,24 +457,28 @@ function nbs.schedule(events, players, opts)
           substituted = true
         end
 
+        -- earliest machine wins; a busy machine is still eligible if the
+        -- note would fire at most `slack` late
         local best, bestBusy
         for _, pi in ipairs(candidates) do
           local b = busyUntil[pi]
-          if b <= t + TICK - dynCost + 1e-9 and (not best or b < bestBusy) then
+          if b <= t + slack + 1e-9 and (not best or b < bestBusy) then
             best, bestBusy = pi, b
           end
         end
 
         if best then
-          busyUntil[best] = math.max(busyUntil[best], t) + dynCost
+          local fireAt = math.max(t, busyUntil[best])
+          busyUntil[best] = fireAt + dynCost
           local inst = note.inst
           if substituted then
             inst = substituteFor(best)
             stats.substituted = stats.substituted + 1
           end
           local a = assignments[best]
-          a[#a + 1] = { t = t, inst = inst, p = note.p }
+          a[#a + 1] = { t = fireAt, inst = inst, p = note.p }
           stats.played = stats.played + 1
+          if fireAt > t + 0.001 then stats.late = stats.late + 1 end
         else
           stats.dropped = stats.dropped + 1
         end

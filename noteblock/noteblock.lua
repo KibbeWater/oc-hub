@@ -15,8 +15,10 @@
 -- Targets: /path/song.nbs | https://noteblock.world/song/<id> | <id> | any URL
 -- Options:
 --   --port=3001      protocol port
---   --pertick=1      max notes per player per game tick (raise if you don't
---                    mind notes slipping a tick on dense chords)
+--   --slack=2        ticks a note may fire late before being dropped;
+--                    spilling quiet chord notes 1-2 ticks recovers most
+--                    of what a single computer would otherwise drop
+--   --pertick=1      max notes per player per game tick
 --   --wait=2         seconds to wait for player discovery
 --   --nofallback     drop notes for missing instruments instead of
 --                    substituting an available one
@@ -471,6 +473,7 @@ local function playFile(path)
     perTick = tonumber(opts.pertick) or 1,
     fallback = not opts.nofallback,
     rsDelay = tonumber(opts.rsdelay) or 0.1,
+    slack = tonumber(opts.slack),
   })
 
   local totalBlocks = 0
@@ -487,13 +490,13 @@ local function playFile(path)
   printf("Players:  %d (%d note blocks)%s", #players, totalBlocks,
     localIndex and ", including this computer" or "")
   local lost = stats.dropped
-  printf("Schedule: %d play (%d via redstone banks), %d merged,"
+  printf("Schedule: %d play (%d banked, %d slightly late), %d merged,"
     .. " %d dropped (%.1f%%), %d substituted",
-    stats.played, stats.bank, stats.merged, lost,
+    stats.played, stats.bank, stats.late, stats.merged, lost,
     stats.total > 0 and (100 * lost / stats.total) or 0, stats.substituted)
   if lost > stats.total * 0.1 then
     print("          (add more players, note blocks, redstone banks,"
-      .. " or raise --pertick)")
+      .. " or raise --slack)")
   end
 
   -- deliver schedules to remote nodes

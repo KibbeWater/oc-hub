@@ -276,17 +276,24 @@ Playback keys: `[space]` pause/resume, `[q]` stop. Downloads are cached in
 `/home/music/`. All NBS versions parse (classic v0 through OpenNBS v5),
 including tempo changers, per-note velocity and detune.
 
-### Why multiple players matter
+### Getting the most out of ONE computer
 
 Each note block `trigger()` is a *synchronized* OpenComputers call — it
 parks the machine until the next server tick — so one computer plays at
-most ~20 notes/second and chords smear. The master schedules around this:
-it merges duplicate notes, sorts chords by velocity (loudest win), assigns
-each note only to a node that *has* that instrument (substituting or
-dropping the quietest overflow), and pre-transmits each node's schedule so
-playback needs no coordination traffic. With the test song, one 4-block
-computer drops 39% of notes; four computers drop none. The schedule report
-before playback shows exactly what was dropped.
+most ~20 notes/second, hard cap, no software can raise it. What software
+*can* do is never waste a slot. The scheduler merges duplicate notes,
+sorts chords by velocity, and — the big one — uses **slack scheduling**:
+when a tick is full, overflow notes fire up to `--slack=2` ticks late
+(quietest last) instead of being dropped. A 100ms spill is barely audible;
+a missing note is not. On the test song this takes a single 4-block
+computer from **39% of notes dropped to 0.1%** — nothing else required.
+`--slack=0` restores strict on-time-or-drop.
+
+The schedule report before playback shows played/late/dropped counts, so
+you always know how a song fits your hardware. When a song is denser than
+~20 notes/s *sustained*, more machines or redstone banks (below) are the
+only ways up — chords also only become truly simultaneous with more
+machines, since one machine serializes them a tick apart.
 
 ### Server racks: more speed with ZERO extra setup
 

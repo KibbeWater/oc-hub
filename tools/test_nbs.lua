@@ -122,18 +122,33 @@ check("all notes accounted for",
 check("assignments match played", #a1[1] == s1.played, #a1[1])
 
 -- single player at 1 note/tick: capacity must be respected
-local soloist = { { inst = { [0] = 1, [1] = 1, [7] = 1, [8] = 1 } } }
-local a2, s2 = nbs.schedule(events, soloist, { perTick = 1 })
-local slotLoad, capacityOk = {}, true
-for _, rec in ipairs(a2[1]) do
-  local slot = math.floor(rec.t * 20)
-  slotLoad[slot] = (slotLoad[slot] or 0) + 1
-  if slotLoad[slot] > 1 then capacityOk = false end
+local function minSpacing(records)
+  local minimum = math.huge
+  for i = 2, #records do
+    minimum = math.min(minimum, records[i].t - records[i - 1].t)
+  end
+  return minimum
 end
-check("solo player respects 1 note/tick", capacityOk)
+
+local soloist = { { inst = { [0] = 1, [1] = 1, [7] = 1, [8] = 1 } } }
+local a2, s2 = nbs.schedule(events, soloist, { perTick = 1, slack = 0 })
+check("strict solo spacing >= 1 tick", minSpacing(a2[1]) >= 0.05 - 0.001,
+  minSpacing(a2[1]))
 check("solo drops the overflow", s2.played + s2.dropped + s2.merged == s2.total)
-print(string.format("     solo: %d played, %d dropped (%.1f%%), %d merged",
-  s2.played, s2.dropped, 100 * s2.dropped / s2.total, s2.merged))
+print(string.format("     strict solo: %d played, %d dropped (%.1f%%)",
+  s2.played, s2.dropped, 100 * s2.dropped / s2.total))
+
+-- default slack lets overflow notes fire a tick or two late instead of
+-- being dropped; machine capacity must still hold
+local a2s, s2s = nbs.schedule(events, soloist, { perTick = 1 })
+check("slack solo spacing >= 1 tick", minSpacing(a2s[1]) >= 0.05 - 0.001,
+  minSpacing(a2s[1]))
+check("slack recovers drops", s2s.dropped < s2.dropped,
+  s2s.dropped .. " vs " .. s2.dropped)
+check("slack late notes counted", s2s.late > 0, s2s.late)
+check("slack accounting", s2s.played + s2s.dropped + s2s.merged == s2s.total)
+print(string.format("     slack solo: %d played (%d late), %d dropped (%.1f%%)",
+  s2s.played, s2s.late, s2s.dropped, 100 * s2s.dropped / s2s.total))
 
 -- four players: fewer drops than one player
 local quartet = {}
