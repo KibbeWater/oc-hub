@@ -12,6 +12,8 @@ Repository: `github.com/KibbeWater/oc-hub`
 | `ocrun` | in-game | Runs a dev script and **hot-restarts it** when the code updates |
 | `ocpush` | in-game | Broadcasts a script wirelessly to a **fleet of ocnet listener nodes** |
 | `mkinstaller` | in-game | Config window that flashes **auto-installer** or **ocnet listener** EEPROMs |
+| `noteblock` | in-game | Note block music player with **noteblock.world** browsing/downloads |
+| `noteplayer` | in-game | Player node: calibrated note blocks the master schedules across |
 | `tools/serve.py` | on PC | Dev server that `ocdev`/`ocrun` sync from |
 
 `oc-manifest.cfg` in the git root declares where every file gets installed
@@ -243,6 +245,54 @@ Worker scripts run in a bare environment (no OpenOS): use
 — the listener transparently intercepts it so updates can always interrupt
 the script. See `examples/blink.lua`. If a script crashes, the node shows
 the error and waits for the next push.
+
+## noteblock — note block music player + noteblock.world
+
+Plays `.nbs` (Note Block Studio) songs on vanilla note blocks, with built-in
+[noteblock.world](https://noteblock.world) browsing, search and downloads.
+A modern rewrite of the classic NoteblockPlayer.
+
+### Setup
+
+1. Place note blocks next to **Adapters** connected to a computer. The block
+   *under* each note block picks the instrument (gold = bell, wood = bass...).
+2. On each computer with note blocks: `noteplayer calibrate` — every block
+   plays, you type its instrument number. Verify with `noteplayer test`.
+3. Single computer? You're done: `noteblock` needs nothing else.
+   More computers = denser songs: run the `noteplayer` daemon on each extra
+   node (wireless card required); the master finds them automatically.
+
+### Usage
+
+```
+noteblock                            browse/search noteblock.world (needs internet card)
+noteblock play <file|url|id> [...]   play local .nbs files or nbw songs
+noteblock search tetris              quick search with ids
+noteblock players                    list discovered player nodes
+noteblock stop                       stop all nodes
+```
+
+Playback keys: `[space]` pause/resume, `[q]` stop. Downloads are cached in
+`/home/music/`. All NBS versions parse (classic v0 through OpenNBS v5),
+including tempo changers, per-note velocity and detune.
+
+### Why multiple players matter
+
+Each note block `trigger()` costs ~1 game tick, so one computer plays at
+most ~20 notes/second — dense chords choke. The master schedules around
+this: it merges duplicate notes, sorts chords by velocity (loudest win),
+assigns each note only to a node that *has* that instrument (substituting
+or dropping the quietest overflow), and pre-transmits each node's schedule
+so playback needs no coordination traffic. With the test song, one 4-block
+computer drops 39% of notes; four computers drop none. The schedule report
+before playback shows exactly what was dropped, so you know when to add
+nodes, note blocks, or `--pertick=2`.
+
+Options: `--pertick=N` (notes per node per game tick, default 1),
+`--wait=S` (discovery window), `--nofallback` (drop notes for missing
+instruments instead of substituting), `--port=3001`.
+
+Test the toolkit on your PC: `lua tools/test_nbs.lua <song.nbs> [packed.zip]`.
 
 ## oc-manifest.cfg reference
 
