@@ -868,38 +868,63 @@ local function guiBrowse()
   local pageSize = math.min(100, ui.h - 6)
   local songList, statusLabel, pageLabel, tabs
 
-  -- background prefetch of the next page while the user reads this one
-  local prefetch = { key = nil, req = nil, chunks = nil, connected = false }
-  local function prefetchCancel()
+  -- background prefetch: neighboring pages load while the user reads the
+  -- current one. One request runs at a time; a queue holds the rest and
+  -- refills as the user navigates, so Next/Prev are usually instant.
+  local prefetch = { key = nil, req = nil, chunks = nil,
+    connected = false, queue = {} }
+  local prefetchKick
+  local function prefetchCancel(clearQueue)
     if prefetch.req then pcall(prefetch.req.close) end
     prefetch.key, prefetch.req, prefetch.chunks = nil, nil, nil
     prefetch.connected = false
+    if clearQueue then prefetch.queue = {} end
   end
-  local function prefetchStart(key, url)
-    if pageCache[key] or prefetch.key == key then return end
-    prefetchCancel()
-    local ok, req = pcall(internet.request, url, nil, UA)
+  prefetchKick = function()
+    if prefetch.req then return end
+    local job = table.remove(prefetch.queue, 1)
+    while job and pageCache[job.key] do
+      job = table.remove(prefetch.queue, 1)
+    end
+    if not job then return end
+    local ok, req = pcall(internet.request, job.url, nil, UA)
     if ok then
-      prefetch.req, prefetch.key, prefetch.chunks = req, key, {}
+      prefetch.req, prefetch.key, prefetch.chunks = req, job.key, {}
+      prefetch.connected = false
     end
   end
+  local function prefetchQueue(key, url)
+    if pageCache[key] or prefetch.key == key then return end
+    for _, job in ipairs(prefetch.queue) do
+      if job.key == key then return end
+    end
+    prefetch.queue[#prefetch.queue + 1] = { key = key, url = url }
+    prefetchKick()
+  end
   local function prefetchPump()
-    if not prefetch.req then return end
+    if not prefetch.req then return prefetchKick() end
     if not prefetch.connected then
       local ok, connected = pcall(prefetch.req.finishConnect)
-      if not ok or connected == nil then return prefetchCancel() end
+      if not ok or connected == nil then
+        prefetchCancel()
+        return prefetchKick()
+      end
       if connected ~= true then return end
       prefetch.connected = true
     end
     for _ = 1, 8 do
       local ok, chunk = pcall(prefetch.req.read)
-      if not ok then return prefetchCancel() end
+      if not ok then
+        prefetchCancel()
+        return prefetchKick()
+      end
       if chunk == nil then
         local okJson, data = pcall(json.decode, table.concat(prefetch.chunks))
         if okJson and type(data) == "table" and data.content then
           pageCache[prefetch.key] = data
         end
-        return prefetchCancel()
+        prefetchCancel()
+        return prefetchKick()
       elseif chunk == "" then
         return
       end
@@ -973,13 +998,17 @@ local function guiBrowse()
     statusLabel:setText(#items == 0 and "nothing here"
       or (#items .. " song(s) - tap one to play"))
     if state.kind == "recent" or state.kind == "search" then
-      prefetchStart(cacheKey(state.kind, state.query, state.page + 1),
+      prefetchQueue(cacheKey(state.kind, state.query, state.page + 1),
         listUrl(state.page + 1))
+      if state.page > 1 then
+        prefetchQueue(cacheKey(state.kind, state.query, state.page - 1),
+          listUrl(state.page - 1))
+      end
     end
   end
 
   local function switchTo(kind, query)
-    prefetchCancel()
+    prefetchCancel(true)
     state = { kind = kind, page = 1, query = query }
     setTabs()
     loadPage()
@@ -1020,7 +1049,7 @@ local function guiBrowse()
           .. tostring(tonumber(item.noteCount) or 0) .. "n"
       end,
       onSelect = function(_, item)
-        prefetchCancel()
+        prefetchCancel(true)
         guiPlaySong(ui, item)
         buildLayout()
         setTabs()
@@ -1070,7 +1099,7 @@ local function guiBrowse()
       end
     end
   end
-  prefetchCancel()
+  prefetchCancel(true)
 
   -- restore a sane terminal
   component.gpu.setBackground(0x000000)
