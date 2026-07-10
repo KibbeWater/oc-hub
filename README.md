@@ -10,7 +10,8 @@ Repository: `github.com/KibbeWater/oc-hub`
 | `ocgit` | in-game | Pull-only git client: `clone` / `pull` / `status` / `install` from GitHub |
 | `ocdev` | in-game | Live sync from your PC — edits appear in-game within seconds |
 | `ocrun` | in-game | Runs a dev script and **hot-restarts it** when the code updates |
-| `mkinstaller` | in-game | Config window that flashes an **auto-installer EEPROM** |
+| `ocpush` | in-game | Broadcasts a script wirelessly to a **fleet of ocnet listener nodes** |
+| `mkinstaller` | in-game | Config window that flashes **auto-installer** or **ocnet listener** EEPROMs |
 | `tools/serve.py` | on PC | Dev server that `ocdev`/`ocrun` sync from |
 
 `oc-manifest.cfg` in the git root declares where every file gets installed
@@ -24,12 +25,15 @@ oc-manifest.cfg        install manifest (what goes where in-game)
 ocgit/ocgit.lua        pull-only git client (GitHub API)
 ocgit/ocdev.lua        live-sync watcher
 ocgit/ocrun.lua        live-sync + managed process with hot restart
+ocgit/ocpush.lua       wireless fleet broadcaster (pairs with netboot)
 ocgit/json.lua         JSON decoder library      -> /usr/lib/json.lua
 ocgit/optimize.lua     Lua source optimizer      -> /usr/lib/optimize.lua
 installer/flash.lua    mkinstaller (EEPROM config window)
-installer/boot.lua     bootstrap BIOS flashed onto the EEPROM (<4KB)
+installer/boot.lua     auto-installer bootstrap BIOS (<4KB)
+installer/netboot.lua  ocnet listener BIOS (<4KB)
 installer/stage2.lua   full installer, downloaded by boot.lua at boot
 installer/luabios.lua  standard Lua BIOS restored after installation
+examples/blink.lua     example worker script for ocnet nodes
 tools/serve.py         dev server for live sync
 ```
 
@@ -189,6 +193,40 @@ reflashing existing EEPROMs.
 
 Target computers need: internet card, a hard drive, and ideally tier 2+ RAM
 (the OpenOS-from-GitHub download builds file lists in memory).
+
+## ocnet — a wireless fleet of script runners
+
+For running dev scripts on many computers at once (20+), flash cheap nodes
+with the **ocnet listener** EEPROM (`mkinstaller`, option 2). A node needs
+only a CPU, RAM, a **wireless network card**, and the EEPROM — no hard
+drive, no OpenOS. On boot it immediately listens on the configured port
+(default 2412) and asks for the current script.
+
+From the master computer (which needs a wireless card too):
+
+```
+ocpush examples/blink.lua --watch     # push + keep watching for changes
+ocpush --ping                         # list nodes and what they run
+ocpush --stop                         # stop the script on all nodes
+```
+
+- Every push broadcasts the script in chunks; nodes verify completeness,
+  then **kill the running script and start the new version**.
+- `--watch` also answers the "hello" a node sends on boot, so nodes that
+  join or reboot later get the current script automatically (debounced, so
+  20 nodes booting at once trigger one push).
+- `--force` restarts nodes even if the content is unchanged;
+  `--optimize` shrinks the script before sending; `--port=` separates
+  independent fleets.
+- Chain it with live sync for PC-to-fleet updates: `ocdev` (or `ocgit pull`)
+  keeps the file fresh on the master, and `ocpush --watch` notices the
+  changed file and re-broadcasts it.
+
+Worker scripts run in a bare environment (no OpenOS): use
+`component`/`computer` directly and sleep via `computer.pullSignal(seconds)`
+— the listener transparently intercepts it so updates can always interrupt
+the script. See `examples/blink.lua`. If a script crashes, the node shows
+the error and waits for the next push.
 
 ## oc-manifest.cfg reference
 

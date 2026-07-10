@@ -1,14 +1,18 @@
--- mkinstaller: build an auto-installer EEPROM (run on a "master" computer).
--- Presents a configuration window where you load a saved profile, the
--- default (last used) configuration, or enter a new one, then flashes the
--- currently inserted EEPROM with installer/boot.lua plus that configuration
--- baked into the EEPROM data area.
+-- mkinstaller: build special-purpose EEPROMs (run on a "master" computer).
+-- Presents a configuration window and flashes the currently inserted EEPROM
+-- as one of:
 --
--- A computer booted from the flashed EEPROM installs OpenOS (if no drive
--- has it) and everything listed in the repo's oc-manifest.cfg, then turns
--- the EEPROM back into a standard Lua BIOS and reboots.
+--   1. auto-installer  (installer/boot.lua) - boots a computer, installs
+--      OpenOS if needed plus everything in oc-manifest.cfg, then turns
+--      itself back into a standard Lua BIOS.
+--   2. ocnet listener  (installer/netboot.lua) - boots straight into a
+--      wireless receiver that runs scripts pushed with 'ocpush' and
+--      hot-restarts them on every update. No OpenOS/drive needed on nodes.
 --
--- Usage: mkinstaller [--bios=<path to boot.lua>]
+-- Installer configurations (repo/branch/...) can be loaded from saved
+-- profiles, the default (last used), or entered fresh.
+--
+-- Usage: mkinstaller [--bios=<path to boot source>]
 
 local component = require("component")
 local fs = require("filesystem")
@@ -20,6 +24,8 @@ local args, opts = shell.parse(...)
 
 local PROFILE_DIR = "/etc/ocinstaller"
 local BACKUP_PATH = "/home/eeprom-backup.lua"
+
+local function printf(fmt, ...) io.write(string.format(fmt, ...), "\n") end
 
 local function fail(msg)
   io.stderr:write("mkinstaller: " .. tostring(msg) .. "\n")
@@ -129,22 +135,22 @@ local function defaultConfig()
   return cfg
 end
 
-------------------------------------------------------------- bios source --
+------------------------------------------------------------ bios source --
 
-local function findBios()
+local function findSource(filename)
   if type(opts.bios) == "string" then
     local path = shell.resolve(opts.bios)
     if not fs.exists(path) then fail("no such file: " .. path) end
     return path
   end
   for _, candidate in ipairs({
-    "/usr/share/ocinstaller/boot.lua",
-    shell.resolve("boot.lua"),
-    shell.resolve("installer/boot.lua"),
+    "/usr/share/ocinstaller/" .. filename,
+    shell.resolve(filename),
+    shell.resolve("installer/" .. filename),
   }) do
     if fs.exists(candidate) then return candidate end
   end
-  fail("cannot find boot.lua; pass --bios=<path>")
+  fail("cannot find " .. filename .. "; pass --bios=<path>")
 end
 
 local function readFile(path)
@@ -172,11 +178,93 @@ local function shrink(code)
   return table.concat(out, "\n")
 end
 
+------------------------------------------------------------------ flash --
+
+local function confirmAndFlash(summary, code, data, label)
+  local maxCode = eeprom.getSize and eeprom.getSize() or 4096
+  local maxData = eeprom.getDataSize and eeprom.getDataSize() or 256
+  if #code > maxCode then
+    term.clear()
+    fail(string.format("BIOS is too large: %d > %d bytes", #code, maxCode))
+  end
+  if #data > maxData then
+    term.clear()
+    fail("configuration string too long for the EEPROM data area")
+  end
+
+  local current = eeprom.get() or ""
+  local looksNormal = current:find("getBootAddress", 1, true) ~= nil
+
+  ui.begin("Flash EEPROM", #summary + 7)
+  for _, s in ipairs(summary) do ui.line(s) end
+  ui.line(string.format("Size:    %d/%d bytes", #code, maxCode))
+  ui.line("EEPROM:  " .. (eeprom.getLabel() or "unlabeled"))
+  ui.line("")
+  if looksNormal then
+    ui.line("Current EEPROM looks like a standard Lua BIOS.")
+  else
+    ui.line("WARNING: current EEPROM is NOT a standard Lua BIOS!")
+  end
+  ui.line("A backup is written to " .. BACKUP_PATH .. ".")
+  ui.line("")
+  local answer = ui.ask("Type FLASH to write", "")
+  term.clear()
+  if answer ~= "FLASH" then fail("aborted, nothing written") end
+
+  if #current > 0 then
+    local f = io.open(BACKUP_PATH, "w")
+    if f then
+      f:write(current)
+      f:close()
+    end
+  end
+  eeprom.set(code)
+  pcall(eeprom.setLabel, label)
+  eeprom.setData(data)
+
+  printf("Flashed '%s' (%d/%d bytes, data %d/%d).",
+    label, #code, maxCode, #data, maxData)
+  printf("Previous EEPROM code backed up to %s.", BACKUP_PATH)
+end
+
 ------------------------------------------------------------------- flow --
+
+ui.begin("mkinstaller - EEPROM flasher", 6)
+ui.line("What kind of EEPROM do you want to make?")
+ui.line("")
+ui.line("  1. auto-installer (OpenOS + oc-manifest.cfg)")
+ui.line("  2. ocnet listener (wireless script runner)")
+ui.line("")
+local kind = ui.ask("Choice", "1")
+
+if kind == "2" then
+  -- ocnet listener: only needs a port
+  ui.begin("ocnet listener", 5)
+  ui.line("Nodes listen on this port for ocpush broadcasts.")
+  ui.line("Use different ports for separate fleets.")
+  ui.line("")
+  local port = ui.ask("Port", "2412")
+  if not tonumber(port) then
+    term.clear()
+    fail("port must be a number")
+  end
+  local code = shrink(readFile(findSource("netboot.lua")))
+  confirmAndFlash({
+    "Type:    ocnet listener",
+    "Port:    " .. port,
+    "",
+  }, code, port, "OCNet Listener")
+  print("")
+  print("Put the EEPROM in a computer with a wireless network card and")
+  print("power on. Push scripts to it with: ocpush <script> --watch")
+  return
+end
+
+-- auto-installer ------------------------------------------------------------
 
 -- step 1: pick a configuration
 local profiles = listProfiles()
-ui.begin("mkinstaller - EEPROM auto-installer", #profiles + 5)
+ui.begin("Auto-installer configuration", #profiles + 5)
 ui.line("Select a configuration:")
 ui.line("")
 ui.line("  0. default (last used / new)")
@@ -213,54 +301,15 @@ if profileName ~= "" then saveProfile(profileName, cfg) end
 saveProfile("default", cfg)
 
 -- step 4: confirm and flash
-local biosPath = findBios()
-local code = shrink(readFile(biosPath))
+local code = shrink(readFile(findSource("boot.lua")))
 local data = string.format("%s/%s|%s|%s", cfg.owner, cfg.repo, cfg.branch, cfg.stage2)
-local maxCode = eeprom.getSize and eeprom.getSize() or 4096
-local maxData = eeprom.getDataSize and eeprom.getDataSize() or 256
-if #code > maxCode then
-  term.clear()
-  fail(string.format("boot.lua is too large: %d > %d bytes", #code, maxCode))
-end
-if #data > maxData then
-  term.clear()
-  fail("configuration string too long for the EEPROM data area")
-end
+confirmAndFlash({
+  "Type:    auto-installer",
+  "Repo:    " .. cfg.owner .. "/" .. cfg.repo .. "@" .. cfg.branch,
+  "Stage-2: " .. cfg.stage2,
+  "",
+}, code, data, "OC Installer")
 
-local current = eeprom.get() or ""
-local looksNormal = current:find("getBootAddress", 1, true) ~= nil
-
-ui.begin("Flash EEPROM", 11)
-ui.line("Repo:    " .. cfg.owner .. "/" .. cfg.repo .. "@" .. cfg.branch)
-ui.line("Stage-2: " .. cfg.stage2)
-ui.line(string.format("BIOS:    %d/%d bytes", #code, maxCode))
-ui.line("EEPROM:  " .. (eeprom.getLabel() or "unlabeled"))
-ui.line("")
-if looksNormal then
-  ui.line("Current EEPROM looks like a standard Lua BIOS.")
-else
-  ui.line("WARNING: current EEPROM is NOT a standard Lua BIOS!")
-end
-ui.line("A backup is written to " .. BACKUP_PATH .. ".")
-ui.line("")
-local answer = ui.ask("Type FLASH to write", "")
-term.clear()
-if answer ~= "FLASH" then fail("aborted, nothing written") end
-
-if #current > 0 then
-  local f = io.open(BACKUP_PATH, "w")
-  if f then
-    f:write(current)
-    f:close()
-  end
-end
-eeprom.set(code)
-pcall(eeprom.setLabel, "OC Installer")
-eeprom.setData(data)
-
-print(string.format("Flashed 'OC Installer' (%d/%d bytes, data %d/%d).",
-  #code, maxCode, #data, maxData))
-print("Previous EEPROM code backed up to " .. BACKUP_PATH .. ".")
 print("")
 print("Put the EEPROM into a computer with an internet card and power on.")
 print("Note: THIS computer now holds the installer EEPROM too. Rebooting")
