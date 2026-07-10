@@ -274,12 +274,14 @@ noteblock stop                       stop all nodes
 ```
 
 The GUI (tier 2+ screens get taps and drag-scrolling; keyboards work
-everywhere: `n`/`p` pages, `s` search, `q` quit, `[space]`/`[q]` during
-playback) has Recent/Featured/Search/Local tabs, per-song download
-progress bars, and a Now Playing screen with pause/stop buttons. It's
-built on `/usr/lib/ocui.lua`, a small reusable touch-first widget toolkit
-(labels, buttons, scrollable lists, progress bars) you can use for your
-own programs.
+everywhere: `n`/`p` pages, `s` search, `q`/backspace go back, `[space]`/
+`[q]` during playback) has Recent/Featured/Search/Local tabs; tapping a
+song opens a **details page** (stats, compatibility, plays/downloads,
+description) with a Play button, then a Now Playing screen with download
+progress and pause/stop buttons — all on a proper back-navigation stack.
+It's built on `/usr/lib/ocui.lua`, a small reusable touch-first widget
+toolkit (labels, buttons, scrollable lists, progress bars, word-wrap, and
+an `ocui.navigator` screen stack) you can use for your own programs.
 
 Speed: songs are cached in `/home/music/` by id, so replays never touch
 the network; the next browse page is prefetched in the background while

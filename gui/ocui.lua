@@ -294,6 +294,89 @@ function ocui.progress(o)
   return o
 end
 
+------------------------------------------------------------ navigation ---
+
+-- A stack of screens with back navigation. A screen is a table with:
+--   build(self, nav, ui)          required: create widgets (screen is
+--                                 already cleared) and populate content
+--   tick(self, nav)               optional: called every pump interval
+--   onKey(self, nav, char, code)  optional: keyboard input
+-- nav:push/pop/replace rebuild the top screen; popping the last screen
+-- (or Ctrl+C) ends nav:run().
+local Nav = {}
+Nav.__index = Nav
+
+function ocui.navigator(ui)
+  return setmetatable({ ui = ui, stack = {} }, Nav)
+end
+
+function Nav:rebuild()
+  local screen = self.stack[#self.stack]
+  self.ui:clear()
+  if screen then
+    screen:build(self, self.ui)
+    self.ui:draw()
+  end
+end
+
+function Nav:push(screen)
+  self.stack[#self.stack + 1] = screen
+  self:rebuild()
+end
+
+function Nav:pop()
+  if #self.stack <= 1 then
+    self.done = true
+    return
+  end
+  self.stack[#self.stack] = nil
+  self:rebuild()
+end
+
+function Nav:replace(screen)
+  self.stack[math.max(1, #self.stack)] = screen
+  self:rebuild()
+end
+
+function Nav:run(interval)
+  self.done = false
+  while not self.done and #self.stack > 0 do
+    local screen = self.stack[#self.stack]
+    if screen.tick then screen:tick(self) end
+    local kind, a, b = self.ui:pump(interval or 0.25)
+    if kind == "quit" then
+      self.done = true
+    elseif kind == "key" and screen.onKey then
+      screen:onKey(self, a, b)
+    end
+  end
+end
+
+--------------------------------------------------------------- helpers ---
+
+-- Greedy word-wrap into lines of at most `width` characters.
+function ocui.wrap(text, width)
+  local lines = {}
+  for paragraph in tostring(text):gmatch("[^\n]+") do
+    local line = ""
+    for word in paragraph:gmatch("%S+") do
+      if unicode.len(word) > width then
+        word = unicode.sub(word, 1, width)
+      end
+      if line == "" then
+        line = word
+      elseif unicode.len(line) + 1 + unicode.len(word) <= width then
+        line = line .. " " .. word
+      else
+        lines[#lines + 1] = line
+        line = word
+      end
+    end
+    if line ~= "" then lines[#lines + 1] = line end
+  end
+  return lines
+end
+
 -- Bottom-line text input (needs a keyboard). Returns the trimmed string
 -- or nil when aborted/empty/no keyboard.
 function ocui.prompt(screen, label)

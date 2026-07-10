@@ -778,93 +778,194 @@ local function wantGui()
   return w >= 40 and h >= 14
 end
 
--- Full-screen playback view; returns when the song ends or is stopped.
-local function guiPlaySong(ui, item)
-  local theme = ocui.theme
-  ui:clear()
-  ui:add(ocui.label{ x = 1, y = 1, w = ui.w, text = "", bg = theme.accent })
-  ui:add(ocui.label{ x = 2, y = 1, w = ui.w - 2, text = "Now Playing",
-    fg = theme.accentText, bg = theme.accent })
-  local titleLabel = ui:add(ocui.label{ x = 3, y = 3, w = ui.w - 4,
-    text = tostring(item.title or "?") })
-  local authorLabel = ui:add(ocui.label{ x = 3, y = 4, w = ui.w - 4,
-    text = tostring(item.originalAuthor or ""), fg = theme.dim })
-  local infoLabel = ui:add(ocui.label{ x = 3, y = 6, w = ui.w - 4,
-    text = "", fg = theme.dim })
-  local statusLabel = ui:add(ocui.label{ x = 3, y = 7, w = ui.w - 4,
-    text = "starting..." })
-  local bar = ui:add(ocui.progress{ x = 3, y = 9, w = ui.w - 4 })
-  local timeLabel = ui:add(ocui.label{ x = 3, y = 10, w = ui.w - 4,
-    text = "", fg = theme.dim })
-  local control = {}
-  local pauseButton = ui:add(ocui.button{ x = 3, y = 12, w = 12,
-    text = " || Pause ",
-    onTap = function() control.action = "toggle" end })
-  ui:add(ocui.button{ x = 17, y = 12, w = 12, text = " [] Stop ",
-    onTap = function() control.action = "stop" end })
-  ui:draw()
+-- Now Playing screen. Playback runs inside build (the playback loop has
+-- its own event pump, so the buttons work); afterwards Back pops to the
+-- details page.
+local function playerScreen(item)
+  return {
+    onKey = function(_, nav, char, code)
+      if char == 113 or code == 14 then nav:pop() end -- q / backspace
+    end,
+    build = function(_, nav, ui)
+      local theme = ocui.theme
+      ui:add(ocui.label{ x = 1, y = 1, w = ui.w, text = "", bg = theme.accent })
+      ui:add(ocui.label{ x = 2, y = 1, w = ui.w - 2, text = "NOW PLAYING",
+        fg = theme.accentText, bg = theme.accent })
+      local titleLabel = ui:add(ocui.label{ x = 3, y = 3, w = ui.w - 4,
+        text = tostring(item.title or "?") })
+      local authorLabel = ui:add(ocui.label{ x = 3, y = 4, w = ui.w - 4,
+        text = tostring(item.originalAuthor or ""), fg = theme.dim })
+      local infoLabel = ui:add(ocui.label{ x = 3, y = 6, w = ui.w - 4,
+        text = "", fg = theme.dim })
+      local statusLabel = ui:add(ocui.label{ x = 3, y = 7, w = ui.w - 4,
+        text = "starting..." })
+      local bar = ui:add(ocui.progress{ x = 3, y = 9, w = ui.w - 4 })
+      local timeLabel = ui:add(ocui.label{ x = 3, y = 10, w = ui.w - 4,
+        text = "", fg = theme.dim })
+      local control = {}
+      local pauseButton = ui:add(ocui.button{ x = 3, y = 12, w = 12,
+        text = " || Pause ",
+        onTap = function() control.action = "toggle" end })
+      local stopButton = ui:add(ocui.button{ x = 17, y = 12, w = 12,
+        text = " [] Stop ",
+        onTap = function() control.action = "stop" end })
+      ui:draw()
 
-  local gui = {
-    ui = ui,
-    control = control,
-    bar = bar,
-    timeLabel = timeLabel,
-    pauseButton = pauseButton,
-    log = function(text) statusLabel:setText(tostring(text)) end,
-    setInfo = function(text) infoLabel:setText(text) end,
-    setTitle = function(title, author)
-      titleLabel:setText(tostring(title))
-      authorLabel:setText(tostring(author or ""))
+      local gui = {
+        ui = ui,
+        control = control,
+        bar = bar,
+        timeLabel = timeLabel,
+        pauseButton = pauseButton,
+        log = function(text) statusLabel:setText(tostring(text)) end,
+        setInfo = function(text) infoLabel:setText(text) end,
+        setTitle = function(title, author)
+          titleLabel:setText(tostring(title))
+          authorLabel:setText(tostring(author or ""))
+        end,
+      }
+
+      local path = item.path
+      if not path then
+        local derr
+        path, derr = downloadSong(item.publicId, {
+          status = function(text) statusLabel:setText(text) end,
+          progress = function(done, total)
+            if total and total > 0 then
+              bar:setValue(done / total)
+              timeLabel:setText(string.format("%d / %d KB",
+                math.floor(done / 1024), math.floor(total / 1024)))
+            else
+              timeLabel:setText(string.format("%d KB", math.floor(done / 1024)))
+            end
+          end,
+        })
+        if path then
+          bar:setValue(0)
+          timeLabel:setText("")
+        else
+          statusLabel:setText("error: " .. tostring(derr))
+        end
+      end
+      if path then
+        playFile(path, gui)
+        statusLabel:setText("finished")
+      end
+
+      -- playback over: swap the controls for Back
+      pauseButton.hidden = true
+      stopButton.hidden = true
+      ui:box(1, 12, ui.w, 1, theme.background)
+      ui:add(ocui.button{ x = 3, y = 12, w = 12, text = " < Back ",
+        onTap = function() nav:pop() end }):draw()
     end,
   }
+end
 
-  local path = item.path
-  if not path then
-    local derr
-    path, derr = downloadSong(item.publicId, {
-      status = function(text) statusLabel:setText(text) end,
-      progress = function(done, total)
-        if total and total > 0 then
-          bar:setValue(done / total)
-          timeLabel:setText(string.format("%d / %d KB",
-            math.floor(done / 1024), math.floor(total / 1024)))
-        else
-          timeLabel:setText(string.format("%d KB", math.floor(done / 1024)))
+-- Song details screen: metadata, stats, description and a Play button.
+local detailCache = {}
+
+local function guiFetchDetails(id)
+  if not detailCache[id] then
+    local data = apiJson(API .. "/song/" .. id)
+    if type(data) == "table" and data.publicId then
+      detailCache[id] = data
+    end
+  end
+  return detailCache[id]
+end
+
+local function detailScreen(item)
+  return {
+    onKey = function(_, nav, char, code)
+      if char == 113 or code == 14 then nav:pop() end -- q / backspace
+    end,
+    build = function(_, nav, ui)
+      local theme = ocui.theme
+      ui:add(ocui.label{ x = 1, y = 1, w = ui.w, text = "", bg = theme.accent })
+      ui:add(ocui.label{ x = 2, y = 1, w = 20, text = "SONG DETAILS",
+        fg = theme.accentText, bg = theme.accent })
+      ui:add(ocui.button{ x = ui.w - 7, y = 1, w = 8, text = " Back ",
+        onTap = function() nav:pop() end })
+      ui:add(ocui.label{ x = 3, y = 3, w = ui.w - 4,
+        text = tostring(item.title or "?") })
+      local byline = ui:add(ocui.label{ x = 3, y = 4, w = ui.w - 4,
+        text = tostring(item.originalAuthor or ""), fg = theme.dim })
+      ui:add(ocui.button{ x = 3, y = ui.h - 1, w = 12, text = " > Play ",
+        primary = true,
+        onTap = function() nav:push(playerScreen(item)) end })
+      ui:add(ocui.button{ x = 17, y = ui.h - 1, w = 12, text = " < Back ",
+        onTap = function() nav:pop() end })
+      ui:draw()
+
+      local row = 6
+      local function addRow(text, fg)
+        if row < ui.h - 2 then
+          ui:add(ocui.label{ x = 3, y = row, w = ui.w - 4,
+            text = text, fg = fg or theme.text }):draw()
+          row = row + 1
         end
-      end,
-    })
-    if path then
-      bar:setValue(0)
-      timeLabel:setText("")
-    else
-      statusLabel:setText("error: " .. tostring(derr))
-    end
-  end
-  if path then
-    playFile(path, gui)
-    statusLabel:setText("finished - tap anywhere to go back")
-  end
+      end
 
-  -- wait for user input (not network noise) before returning
-  while true do
-    local kind, extra = ui:pump(math.huge)
-    if kind == "quit" or kind == "key" or kind == "tap" or kind == "drop" then
-      return
-    end
-    if kind == "other" and type(extra) == "table"
-      and (extra[1] == "touch" or extra[1] == "drop") then
-      return
-    end
-  end
+      if item.path then
+        addRow("local file", theme.dim)
+        addRow(item.path)
+        addRow(string.format("%d KB",
+          math.floor((fs.size(item.path) or 0) / 1024)), theme.dim)
+        return
+      end
+
+      local loading = ui:add(ocui.label{ x = 3, y = row, w = ui.w - 4,
+        text = "loading details...", fg = theme.dim })
+      loading:draw()
+      local details = guiFetchDetails(item.publicId)
+      loading.hidden = true
+      if not details then
+        addRow("could not load details", theme.bad)
+        return
+      end
+      local stats = details.stats or {}
+      byline:setText(string.format("by %s%s",
+        tostring((details.uploader or {}).username or "?"),
+        (details.originalAuthor or "") ~= ""
+          and (" | original: " .. tostring(details.originalAuthor)) or ""))
+      addRow(string.format("%s | %d notes | %.4g t/s | NBS v%s",
+        fmtTime(tonumber(stats.duration) or 0),
+        tonumber(stats.noteCount) or 0,
+        tonumber(stats.tempo) or 0,
+        tostring(stats.nbsVersion or "?")))
+      local customCount = tonumber(stats.customInstrumentCount) or 0
+      addRow(string.format("%d layers | %d instruments%s",
+        tonumber(stats.layerCount) or 0,
+        (tonumber(stats.vanillaInstrumentCount) or 0) + customCount,
+        customCount > 0 and (" (" .. customCount .. " custom)") or ""))
+      addRow(stats.compatible and "note block compatible"
+        or "not fully note block compatible",
+        stats.compatible and theme.good or theme.warn)
+      addRow(string.format("%d plays | %d downloads | %d KB | %s",
+        tonumber(details.playCount) or 0,
+        tonumber(details.downloadCount) or 0,
+        math.floor((tonumber(details.fileSize) or 0) / 1024),
+        tostring(details.category or "?")), theme.dim)
+      local description = tostring(details.description or "")
+      if description ~= "" then
+        row = row + 1
+        for _, line in ipairs(ocui.wrap(description, ui.w - 6)) do
+          if row >= ui.h - 2 then break end
+          addRow(line, theme.dim)
+        end
+      end
+    end,
+  }
 end
 
 local function guiBrowse()
   ensureInternet()
   local ui = ocui.new(component.gpu)
+  local nav = ocui.navigator(ui)
   local theme = ocui.theme
   local state = { kind = "recent", page = 1, query = nil }
   local pageCache = {}
-  local quit = false
   local pageSize = math.min(100, ui.h - 6)
   local songList, statusLabel, pageLabel, tabs
 
@@ -1020,7 +1121,7 @@ local function guiBrowse()
     ui:add(ocui.label{ x = 2, y = 1, w = ui.w - 10,
       text = "NOTE BLOCK WORLD", fg = theme.accentText, bg = theme.accent })
     ui:add(ocui.button{ x = ui.w - 7, y = 1, w = 8, text = " Quit ",
-      onTap = function() quit = true end })
+      onTap = function() nav.done = true end })
     tabs = {}
     local x = 2
     for _, def in ipairs({ { "Recent", "recent" }, { "Featured", "featured" },
@@ -1049,12 +1150,7 @@ local function guiBrowse()
           .. tostring(tonumber(item.noteCount) or 0) .. "n"
       end,
       onSelect = function(_, item)
-        prefetchCancel(true)
-        guiPlaySong(ui, item)
-        buildLayout()
-        setTabs()
-        loadPage()
-        ui:draw()
+        nav:push(detailScreen(item))
       end })
     ui:add(ocui.button{ x = 2, y = ui.h - 1, w = 10, text = " < Prev ",
       onTap = function()
@@ -1075,30 +1171,34 @@ local function guiBrowse()
     ui:draw()
   end
 
-  buildLayout()
-  setTabs()
-  loadPage()
-  ui:draw()
-
-  while not quit do
-    prefetchPump()
-    local kind, a = ui:pump(0.25)
-    if kind == "quit" then break end
-    if kind == "key" then
-      if a == 113 then break -- q
-      elseif a == 110 then -- n
+  local browseScreen = {
+    build = function()
+      buildLayout()
+      setTabs()
+      loadPage()
+    end,
+    tick = function()
+      prefetchPump()
+    end,
+    onKey = function(_, navigator, char)
+      if char == 113 then -- q
+        navigator:pop()
+      elseif char == 110 then -- n
         state.page = state.page + 1
         loadPage()
-      elseif a == 112 and state.page > 1 then -- p
+      elseif char == 112 and state.page > 1 then -- p
         state.page = state.page - 1
         loadPage()
-      elseif a == 115 then -- s
+      elseif char == 115 then -- s
         local query = ocui.prompt(ui, "Search")
         ui:draw()
         if query then switchTo("search", query) end
       end
-    end
-  end
+    end,
+  }
+
+  nav:push(browseScreen)
+  nav:run(0.25)
   prefetchCancel(true)
 
   -- restore a sane terminal
