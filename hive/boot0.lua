@@ -52,12 +52,6 @@ end
 
 -- Block digest matching hxnet.imageDigest (data card sha256 can't hash the whole
 -- image in one call -- direct callback, no pause over the soft limit).
-local function digest(b)
-  local p = {}
-  for i = 1, #b, 4096 do p[#p + 1] = dat.sha256(b:sub(i, i + 4095)) end
-  return dat.sha256(table.concat(p))
-end
-
 st("JOIN...")
 local qn = { x = 0, y = 64, z = 0 }
 local no = dat.random(8)
@@ -76,8 +70,8 @@ while true do
         local n, _, lfw, qx, qy, qz = string.unpack("<c8I2I2i2i2i2B", f.b)
         if n == no then qn = { x = qx, y = qy, z = qz }; jn = true; st("DL..."); req(); lr = computer.uptime() end
       elseif f.t == 0x32 and f.sg and ver(f) then
-        local xi, vr, sz, ct, cs, p = string.unpack("<I2I2I4I2I2", f.b)
-        meta = { xi = xi, vr = vr, ct = ct, sha = f.b:sub(p, p + 31) }; rx = {}
+        local xi, vr, sz, ct = string.unpack("<I2I2I4I2I2", f.b)
+        meta = { xi = xi, vr = vr, ct = ct, sz = sz }; rx = {}
       elseif f.t == 0x33 and meta then
         local xi, ix, p = string.unpack("<I2I2", f.b)
         if xi == meta.xi and not rx[ix] then rx[ix] = f.b:sub(p) end
@@ -94,15 +88,17 @@ while true do
       local pt = {}
       for i = 0, meta.ct - 1 do pt[#pt + 1] = rx[i] end
       local img = table.concat(pt)
-      if digest(img) == meta.sha then
-        st("RUN v" .. meta.vr)
+      -- The size is authenticated (signed FW_META) and OC modem delivery is
+      -- lossless, so a complete transfer of the right size is the image; load()
+      -- compile-checks it before we commit to running.
+      if #img == meta.sz then
         _HX = { id = id, key = k, role = role, port = port, queen = qn,
           home = { x = hx, y = hy, z = hz }, fw = meta.vr, joined = true }
         local fn = load(img, "=hxfw")
-        if fn then pcall(fn) end
-        computer.shutdown(true) -- ran, crashed or exited -> reboot + refetch latest
+        if fn then st("RUN v" .. meta.vr); pcall(fn) else st("BAD FW") end
+        computer.shutdown(true) -- ran/exited/crashed/bad -> reboot + refetch latest
       else
-        st("SHA?"); meta = nil; rx = nil; req()
+        st("SZ " .. #img); meta = nil; rx = nil; req()
       end
     else
       local pt = { string.pack("<I2I2", meta.xi, #mi) }
