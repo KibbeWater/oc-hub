@@ -264,8 +264,11 @@ end
 function hxnet.parse.fwreq(b) return string.unpack("<BBI2", b) end
 
 -- FW_META: fixed head + 32-byte sha256 + optional appended file table (robot bundles).
+-- Pad/truncate the digest to 32 bytes rather than assert, so a short/nil digest
+-- can never abort a transfer (the device verifies by size, not this hash).
 function hxnet.pack.fwmeta(xferId, ver, size, count, chunkSize, sha, extra)
-  assert(#sha == 32, "sha256 must be 32 bytes")
+  sha = (sha or ""):sub(1, 32)
+  if #sha < 32 then sha = sha .. ("\0"):rep(32 - #sha) end
   return string.pack("<I2I2I4I2I2", xferId, ver, size, count, chunkSize) .. sha .. (extra or "")
 end
 function hxnet.parse.fwmeta(b)

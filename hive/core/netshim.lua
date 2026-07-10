@@ -94,10 +94,10 @@ function netshim.new(opts)
     local xferId = nextXfer
     nextXfer = (nextXfer + 1) % 65536
     transfers[devId] = { tx = tx, xferId = xferId, version = version, sha = sha }
+    logf("transfer to %d: %d chunks, %d B", devId, tx.count, tx.size)
     node:cast(devId, hxnet.T.FW_META,
       hxnet.pack.fwmeta(xferId, version, tx.size, tx.count, chunkSize, sha),
       { ttl = 5, signed = true })
-    logf("transfer to %d: %d chunks, %d B", devId, tx.count, tx.size)
     for i = 0, tx.count - 1 do
       node:cast(devId, hxnet.T.FW_CHUNK, hxnet.pack.fwchunk(xferId, i, tx.chunk(i)), { ttl = 5 })
       pace() -- space chunks so a burst doesn't overrun the receiver
