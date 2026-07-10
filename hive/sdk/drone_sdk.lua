@@ -270,6 +270,9 @@ function sdk.main(role, ctx)
   end
 
   node:on(hxnet.T.WELCOME, function(f)
+    -- If the bootloader already joined, ignore stray/rebroadcast welcomes: acting
+    -- on them (e.g. an OTA trigger) with no matching HELLO nonce caused reboots.
+    if ctx.joined then return end
     local nonce, dev, latestFw, qx, qy, qz = hxnet.parse.welcome(f.body)
     if ctx.nonce and nonce ~= ctx.nonce then return end -- bind to our HELLO
     queen = { x = qx, y = qy, z = qz }
@@ -307,14 +310,12 @@ function sdk.main(role, ctx)
 
   local LOW, CRIT = 0.40, 0.10
   local guard = 0
-  while not state.reboot do
-    guard = guard + 1
-    if ctx.maxSteps and guard > ctx.maxSteps then break end -- sim safety
-    -- report a handler crash instead of letting it unwind into a reboot
-    local pok, perr = pcall(pumpOnce, 0.25)
-    if not pok then sendEvt(hxnet.EVT.NAV_FAIL, tostring(perr):sub(1, 100)) end
-    pcall(heartbeat)
-    if ctx.findWaypoints and (ctx.now() - state.lastCal) >= 120 then pcall(calibrate) end
+  -- One loop iteration, wrapped so ANY error is reported to the queen and retried
+  -- rather than unwinding into a silent boot0 reboot.
+  local function tick()
+    pumpOnce(0.25)
+    heartbeat()
+    if ctx.findWaypoints and (ctx.now() - state.lastCal) >= 120 then calibrate() end
     local e = ctx.energy() or 1
     if node.coverage:best() then state.everCov = true end -- latch: had coverage at least once
 
@@ -326,8 +327,9 @@ function sdk.main(role, ctx)
       heartbeat(true)
       api.sleep(1)
     elseif state.otaVer and not state.task then
-      if ctx.reboot then ctx.reboot() end
-      break
+      sendEvt(hxnet.EVT.NAV_FAIL, "ota " .. tostring(ctx.fw) .. "->" .. tostring(state.otaVer))
+      state.reboot = true
+      return
     elseif state.task and e >= LOW then
       state.aborted = false
       state.runState = hxnet.STATE.WORKING
@@ -361,6 +363,16 @@ function sdk.main(role, ctx)
       pcall(role.onIdle, api)
     else
       api.sleep(0.5)
+    end
+  end
+
+  while not state.reboot do
+    guard = guard + 1
+    if ctx.maxSteps and guard > ctx.maxSteps then break end -- sim safety
+    local ok, err = pcall(tick)
+    if not ok then
+      sendEvt(hxnet.EVT.NAV_FAIL, "loop:" .. tostring(err):sub(1, 90))
+      pcall(api.sleep, 0.5)
     end
   end
   if state.reboot and ctx.reboot then ctx.reboot() end
