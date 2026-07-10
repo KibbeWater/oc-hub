@@ -47,6 +47,15 @@ local function fail(msg)
   os.exit(1)
 end
 
+-- catch a stale nbs.lua shadowing the installed one
+if nbs.VERSION ~= 3 then
+  local where = package.searchpath
+    and package.searchpath("nbs", package.path) or "an unknown path"
+  fail("outdated nbs library loaded from " .. tostring(where)
+    .. "; delete that stale copy (the current one installs to"
+    .. " /usr/lib/nbs.lua)")
+end
+
 ------------------------------------------------------------ calibration --
 -- Config schema: { blocks = {address -> instrument},
 --                  banks  = { {addr = <redstone address>,

@@ -323,8 +323,9 @@ end
 -- packed strings all the way through (this size OOM'd/timed out the old
 -- table-per-note pipeline on real OC hardware)
 local TICKS, PER = 600, 20
+-- v6 file: vanilla count 20 (built-in copper trumpets at 16-19)
 local header = table.concat({
-  u16le(0), string.char(5), string.char(16),
+  u16le(0), string.char(6), string.char(20),
   u16le(TICKS), u16le(PER),
   i32str("Big Song"), i32str(""), i32str(""), i32str(""),
   u16le(1000), string.char(0, 0), string.char(4),
@@ -336,7 +337,7 @@ for _ = 1, TICKS do
   parts[#parts + 1] = u16le(1)
   for i = 1, PER do
     parts[#parts + 1] = u16le(1)
-      .. string.char(i % 16, 33 + (i * 7) % 25, 100, 100) .. u16le(0)
+      .. string.char(i % 20, 33 + (i * 7) % 25, 100, 100) .. u16le(0)
   end
   parts[#parts + 1] = u16le(0)
 end
@@ -350,8 +351,10 @@ local bigData = table.concat(parts)
 local yields = 0
 nbs.onYield = function() yields = yields + 1 end
 local bigSong, bigErr = nbs.parse(bigData)
-check("big song parses", bigSong ~= nil, bigErr)
+check("big v6 song parses", bigSong ~= nil, bigErr)
 if bigSong then
+  check("big song is v6 with 20 builtins",
+    bigSong.version == 6 and bigSong.vanillaCount == 20, bigSong.version)
   check("big song note count", bigSong.noteCount == TICKS * PER, bigSong.noteCount)
   local bigEvents = nbs.timeline(bigSong)
   local bigBand = { inst = {} }
@@ -360,6 +363,11 @@ if bigSong then
   check("big song schedules everything",
     bigStats.played + bigStats.dropped + bigStats.merged == bigStats.total,
     bigStats.total)
+  -- with ample capacity, the copper trumpet notes (inst 16-19) must land
+  -- as substituted vanilla instruments rather than being dropped
+  local _, richStats = nbs.schedule(bigEvents, { bigBand }, { perTick = 99 })
+  check("v6 trumpets get substituted", richStats.substituted == TICKS * 4,
+    richStats.substituted)
   check("heavy loops yield for the watchdog", yields > 10, yields)
   print(string.format(
     "     big song: %d KB file, %d notes, %d actions out, %d yields",

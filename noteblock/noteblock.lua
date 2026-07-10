@@ -63,6 +63,16 @@ local function fail(msg)
   os.exit(1)
 end
 
+-- catch a stale nbs.lua shadowing the installed one (package.path checks
+-- /lib and other locations before/after /usr/lib)
+if nbs.VERSION ~= 3 then
+  local where = package.searchpath
+    and package.searchpath("nbs", package.path) or "an unknown path"
+  fail("outdated nbs library loaded from " .. tostring(where)
+    .. "; delete that stale copy (the current one installs to"
+    .. " /usr/lib/nbs.lua via 'ocgit install')")
+end
+
 local function fmtTime(seconds)
   seconds = math.max(0, math.floor(seconds + 0.5))
   return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)

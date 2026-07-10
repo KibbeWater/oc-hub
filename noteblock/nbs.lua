@@ -1,5 +1,5 @@
 -- nbs.lua: Note Block Studio (.nbs) toolkit for OpenComputers.
--- Parses every NBS version (classic v0 through OpenNBS v5), converts songs
+-- Parses every NBS version (classic v0 through OpenNBS v6), converts songs
 -- to an absolute-time event list (handling OpenNBS "Tempo Changer" custom
 -- instruments), schedules notes across player computers, and extracts
 -- .nbs files from stored (uncompressed) zips as served by noteblock.world.
@@ -13,6 +13,11 @@
 -- watchdog.
 
 local nbs = {}
+
+-- Internal compatibility number, bumped whenever the schedule/blob format
+-- changes. Programs check this to catch stale nbs.lua copies that shadow
+-- the installed one in package.path.
+nbs.VERSION = 3
 
 -- Called every few hundred notes inside heavy loops; assign a function
 -- that yields (e.g. function() os.sleep(0) end) when running in OpenOS.
@@ -125,7 +130,10 @@ function nbs.parse(data)
   local first = r:u16()
   if first == 0 then
     song.version = r:u8()
-    if song.version < 1 or song.version > 5 then
+    -- v6 (OpenNBS 2025+) adds built-in instruments 16-19 (copper trumpets)
+    -- and moves custom instruments to index 20; the layout is unchanged,
+    -- and the header's vanilla count keeps everything else aligned
+    if song.version < 1 or song.version > 6 then
       return nil, "unsupported NBS version " .. song.version
     end
     song.vanillaCount = r:u8()
