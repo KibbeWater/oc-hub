@@ -29,6 +29,19 @@ local function readAll(path)
   return data
 end
 
+-- decodes a scheduled action blob into {t, kind, a, b} records
+local function decodeAll(blob)
+  local records = {}
+  local i = 1
+  while true do
+    local t, kind, a, b = nbs.readRecord(blob, i)
+    if not t then break end
+    records[#records + 1] = { t = t, kind = kind, a = a, b = b }
+    i = i + 1
+  end
+  return records
+end
+
 -- zip extraction --------------------------------------------------------
 
 local fileData = readAll(nbsPath)
@@ -60,8 +73,8 @@ check("length 886 ticks", song.lengthTicks == 886, song.lengthTicks)
 
 local instCounts = {}
 for _, bucket in ipairs(song.ticks) do
-  for _, note in ipairs(bucket.notes) do
-    instCounts[note.inst] = (instCounts[note.inst] or 0) + 1
+  for inst in nbs.eachNote(bucket.n) do
+    instCounts[inst] = (instCounts[inst] or 0) + 1
   end
 end
 -- API stats.instrumentNoteCounts: [264,84,0,0,0,0,0,33,324,0,...]
@@ -119,7 +132,7 @@ check("full band drops nothing", s1.dropped == 0, s1.dropped)
 check("all notes accounted for",
   s1.played + s1.dropped + s1.merged == s1.total,
   s1.played .. "+" .. s1.dropped .. "+" .. s1.merged .. " vs " .. s1.total)
-check("assignments match played", #a1[1] == s1.played, #a1[1])
+check("assignments match played", #decodeAll(a1[1]) == s1.played, #decodeAll(a1[1]))
 
 -- single player at 1 note/tick: capacity must be respected
 local function minSpacing(records)
@@ -132,8 +145,8 @@ end
 
 local soloist = { { inst = { [0] = 1, [1] = 1, [7] = 1, [8] = 1 } } }
 local a2, s2 = nbs.schedule(events, soloist, { perTick = 1, slack = 0 })
-check("strict solo spacing >= 1 tick", minSpacing(a2[1]) >= 0.05 - 0.001,
-  minSpacing(a2[1]))
+check("strict solo spacing >= 1 tick", minSpacing(decodeAll(a2[1])) >= 0.05 - 0.001,
+  minSpacing(decodeAll(a2[1])))
 check("solo drops the overflow", s2.played + s2.dropped + s2.merged == s2.total)
 print(string.format("     strict solo: %d played, %d dropped (%.1f%%)",
   s2.played, s2.dropped, 100 * s2.dropped / s2.total))
@@ -141,8 +154,8 @@ print(string.format("     strict solo: %d played, %d dropped (%.1f%%)",
 -- default slack lets overflow notes fire a tick or two late instead of
 -- being dropped; machine capacity must still hold
 local a2s, s2s = nbs.schedule(events, soloist, { perTick = 1 })
-check("slack solo spacing >= 1 tick", minSpacing(a2s[1]) >= 0.05 - 0.001,
-  minSpacing(a2s[1]))
+check("slack solo spacing >= 1 tick", minSpacing(decodeAll(a2s[1])) >= 0.05 - 0.001,
+  minSpacing(decodeAll(a2s[1])))
 check("slack recovers drops", s2s.dropped < s2.dropped,
   s2s.dropped .. " vs " .. s2.dropped)
 check("slack late notes counted", s2s.late > 0, s2s.late)
@@ -200,20 +213,21 @@ check("organ tunings valid", tuningOk)
 -- a side may never be high in two consecutive volleys (no rising edge)
 local volleyOk, edgeOk = true, true
 local lastTime, lastMask = {}, {}
-for _, rec in ipairs(aB[1]) do
-  if rec.volley then
-    if lastTime[rec.dev] and rec.t - lastTime[rec.dev] < 0.15 - 0.001 then
+for _, rec in ipairs(decodeAll(aB[1])) do
+  if rec.kind == nbs.KIND_VOLLEY then
+    local dev, mask = rec.a, rec.b
+    if lastTime[dev] and rec.t - lastTime[dev] < 0.15 - 0.001 then
       volleyOk = false
     end
     local overlap = 0
-    local m1, m2 = lastMask[rec.dev] or 0, rec.mask
+    local m1, m2 = lastMask[dev] or 0, mask
     for _ = 1, 6 do
       if m1 % 2 == 1 and m2 % 2 == 1 then overlap = overlap + 1 end
       m1 = math.floor(m1 / 2)
       m2 = math.floor(m2 / 2)
     end
     if overlap > 0 then edgeOk = false end
-    lastTime[rec.dev], lastMask[rec.dev] = rec.t, rec.mask
+    lastTime[dev], lastMask[dev] = rec.t, mask
   end
 end
 check("volleys respect device cadence", volleyOk)
@@ -298,12 +312,61 @@ if old then
   check("v0 name", old.name == "Classic", old.name)
   check("v0 tempo", math.abs(old.tempo - 10) < 0.001, old.tempo)
   check("v0 note count", old.noteCount == 3, old.noteCount)
-  check("v0 layer volume applied",
-    old.ticks[1].notes[1].vel == 50, old.ticks[1].notes[1].vel)
+  local _, _, vel0 = nbs.eachNote(old.ticks[1].n)()
+  check("v0 layer volume applied", vel0 == 50, vel0)
   local ev0 = nbs.timeline(old)
   check("v0 timeline times", math.abs(ev0[2].time - 0.2) < 0.001,
     ev0[2] and ev0[2].time)
 end
+
+-- large song stress: ~100KB / 12000 notes must parse and schedule with
+-- packed strings all the way through (this size OOM'd/timed out the old
+-- table-per-note pipeline on real OC hardware)
+local TICKS, PER = 600, 20
+local header = table.concat({
+  u16le(0), string.char(5), string.char(16),
+  u16le(TICKS), u16le(PER),
+  i32str("Big Song"), i32str(""), i32str(""), i32str(""),
+  u16le(1000), string.char(0, 0), string.char(4),
+  string.rep("\0", 20), i32str(""),
+  string.char(0, 0), u16le(0), -- loop settings (v4+)
+})
+local parts = { header }
+for _ = 1, TICKS do
+  parts[#parts + 1] = u16le(1)
+  for i = 1, PER do
+    parts[#parts + 1] = u16le(1)
+      .. string.char(i % 16, 33 + (i * 7) % 25, 100, 100) .. u16le(0)
+  end
+  parts[#parts + 1] = u16le(0)
+end
+parts[#parts + 1] = u16le(0)
+for _ = 1, PER do -- layers
+  parts[#parts + 1] = i32str("") .. string.char(0, 100, 100)
+end
+parts[#parts + 1] = string.char(0) -- no custom instruments
+local bigData = table.concat(parts)
+
+local yields = 0
+nbs.onYield = function() yields = yields + 1 end
+local bigSong, bigErr = nbs.parse(bigData)
+check("big song parses", bigSong ~= nil, bigErr)
+if bigSong then
+  check("big song note count", bigSong.noteCount == TICKS * PER, bigSong.noteCount)
+  local bigEvents = nbs.timeline(bigSong)
+  local bigBand = { inst = {} }
+  for i = 0, 15 do bigBand.inst[i] = 1 end
+  local bigAsn, bigStats = nbs.schedule(bigEvents, { bigBand }, {})
+  check("big song schedules everything",
+    bigStats.played + bigStats.dropped + bigStats.merged == bigStats.total,
+    bigStats.total)
+  check("heavy loops yield for the watchdog", yields > 10, yields)
+  print(string.format(
+    "     big song: %d KB file, %d notes, %d actions out, %d yields",
+    math.floor(#bigData / 1024), TICKS * PER,
+    math.floor(#bigAsn[1] / nbs.RECORD_SIZE), yields))
+end
+nbs.onYield = nil
 
 print("")
 if failures == 0 then

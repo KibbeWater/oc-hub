@@ -52,6 +52,10 @@ local PAGE_SIZE = 8
 local args, opts = shell.parse(...)
 local port = tonumber(opts.port) or 3001
 
+-- let the nbs library yield inside its heavy loops so large songs don't
+-- trip the "too long without yielding" watchdog
+nbs.onYield = function() os.sleep(0) end
+
 local function printf(fmt, ...) io.write(string.format(fmt, ...), "\n") end
 
 local function fail(msg)
@@ -513,8 +517,8 @@ local function playFile(path)
   for index, addr in pairs(remote) do
     if #assignments[index] > 0 then
       io.write(string.format("sending %d action(s) to %s... ",
-        #assignments[index], addr:sub(1, 8)))
-      if transmit(modem, addr, songId, title, nbs.encodeRecords(assignments[index])) then
+        #assignments[index] / nbs.RECORD_SIZE, addr:sub(1, 8)))
+      if transmit(modem, addr, songId, title, assignments[index]) then
         io.write("ok")
         -- per-song bank tuning; the node confirms once its blocks are set
         if #tunings[index] > 0 then
@@ -566,7 +570,8 @@ local function playFile(path)
     duration = duration,
     delay = delay,
     modem = modem,
-    localBlob = localIndex and nbs.encodeRecords(assignments[localIndex]) or nil,
+    localBlob = localIndex and #assignments[localIndex] > 0
+      and assignments[localIndex] or nil,
     localBlocks = localBlocks,
     localBanks = localBanks,
   })
@@ -646,29 +651,53 @@ end
 -- node, which verifies, installs and reboots. So only the master ever
 -- needs internet access: 'ocgit pull && ocgit install' here, then
 -- 'noteblock update' ships it to the whole fleet.
-local UPDATE_FILES = {
-  "/usr/lib/nbs.lua",
-  "/usr/bin/noteplayer.lua",
-}
+
+-- Locate this computer's installed copies wherever they actually live:
+-- the nbs library through package.path (however require() found it), the
+-- noteplayer program through the shell search path. Nodes always install
+-- to the canonical destinations.
+local function updateSources()
+  local sources = {
+    {
+      src = package.searchpath and package.searchpath("nbs", package.path),
+      dst = "/usr/lib/nbs.lua",
+      name = "nbs.lua",
+    },
+    {
+      src = shell.resolve("noteplayer", "lua"),
+      dst = "/usr/bin/noteplayer.lua",
+      name = "noteplayer.lua",
+    },
+  }
+  for _, entry in ipairs(sources) do
+    if not entry.src or not fs.exists(entry.src) then
+      fail("cannot find " .. entry.name .. " on this computer;"
+        .. " run 'ocgit install' first")
+    end
+  end
+  return sources
+end
 
 local function commandUpdate()
   local modem = openModem()
   if not modem then fail("a network card is required") end
 
+  local sources = updateSources()
   local bodies = {}
-  for i, path in ipairs(UPDATE_FILES) do
-    local f, err = io.open(path, "rb")
-    if not f then fail("cannot read " .. path .. ": " .. tostring(err)) end
+  for i, entry in ipairs(sources) do
+    local f, err = io.open(entry.src, "rb")
+    if not f then fail("cannot read " .. entry.src .. ": " .. tostring(err)) end
     bodies[i] = f:read("*a")
     f:close()
+    printf("shipping %s (%d bytes, from %s)", entry.name, #bodies[i], entry.src)
   end
 
   local id = tostring(math.floor(computer.uptime() * 100))
-  modem.broadcast(port, PROTOCOL, "upd-begin", id, #UPDATE_FILES)
+  modem.broadcast(port, PROTOCOL, "upd-begin", id, #sources)
   local chunkCounts = {}
   for i, body in ipairs(bodies) do
     chunkCounts[i] = math.ceil(#body / CHUNK)
-    modem.broadcast(port, PROTOCOL, "upd-file", id, i, UPDATE_FILES[i], chunkCounts[i])
+    modem.broadcast(port, PROTOCOL, "upd-file", id, i, sources[i].dst, chunkCounts[i])
   end
 
   local function sendChunk(index, seq)
@@ -710,7 +739,7 @@ local function commandUpdate()
       if seq == 0 then
         -- node missed the file header entirely
         modem.broadcast(port, PROTOCOL, "upd-file", id, index,
-          UPDATE_FILES[index], chunkCounts[index])
+          sources[index].dst, chunkCounts[index])
         for s = 1, chunkCounts[index] do sendChunk(index, s) end
       else
         sendChunk(index, seq)
