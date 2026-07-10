@@ -268,6 +268,134 @@ end
 check("miner clears an authorized slab (DESTRUCTION grant)", runMiner(hxnet.MODE.DESTRUCTION))
 check("miner refuses digging without DESTRUCTION (SCOUT grant)", not runMiner(hxnet.MODE.SCOUT))
 
+-- courier: ferry items between two chests over multiple trips ---------------
+
+do
+  local w = hivesim.world{ surface = hivesim.terrain.plains(5) }
+  w.chestSet(10, 64, 0, 100) -- source
+  local ck = hivesim.clock()
+  local dr = hivesim.drone(w, 0, 80, 0, { cap = 32 })
+  local courier = require("courier")
+  local qIn, dIn, assigned = {}, {}, false
+  local reg = registryLib.new{ store = store.new{ fs = hivesim.memfs() }, now = ck.now }
+  local qnet = netshim.new{ id = 0, master = master, hmac = fakeHmac, now = ck.now, epoch = 2,
+    send = function(wire) dIn[#dIn + 1] = wire end }
+  qnet.onHello(function(id, info)
+    reg.join(id, { role = "courier", kind = "drone", caps = { "courier" } })
+    qnet.welcome(id, info.nonce, id, 0, 0, 64, 0, 1)
+  end)
+  qnet.onTelem(function(id, b) reg.upsertBeacon(id, b) end)
+  qnet.onEvt(function() end)
+  local ctx = {
+    id = 11, key = hxnet.deriveKey(master, 11, fakeHmac), hmac = fakeHmac, now = ck.now,
+    role = 4, fw = 1, nonce = "courier1", queen = { x = 0, y = 64, z = 0 }, home = { x = 0, y = 64, z = 0 },
+    send = function(wire) qIn[#qIn + 1] = wire end,
+    pull = function(t) return coroutine.yield(t) end,
+    navPos = function() return dr.pos() end,
+    droneMove = function(dx, dy, dz) dr.move(dx, dy, dz) end,
+    droneOffset = function() return dr.offset() end,
+    geoScan = function() return {} end,
+    energy = function() return dr.energyFrac() end,
+    suck = function() return dr.suckBelow(w) end,
+    drop = function() return dr.dropBelow(w) end,
+    invCount = function() return dr.invCount() end,
+    setStatus = function() end,
+  }
+  local function serviceQueen()
+    while #qIn > 0 do qnet.submit("d", 5, table.remove(qIn, 1)) end
+    for id, d in pairs(reg.all()) do
+      if (d.state == hxnet.STATE.IDLE or d.state == "idle") and not d.taskId and not assigned then
+        local task = { type = "ferry", params = { from = { x = 10, y = 64, z = 0 },
+          to = { x = 30, y = 64, z = 0 }, count = 64 } }
+        local area = { x1 = 10, z1 = 0, x2 = 30, z2 = 0 }
+        reg.setTask(id, "F1"); assigned = true
+        qnet.cmd(id, hxnet.CMD.ASSIGN,
+          require("drone_sdk").encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.TRANSPORT, area, 600))
+      end
+    end
+  end
+  local co = coroutine.create(function() require("drone_sdk").main(courier, ctx) end)
+  local ok, dt = coroutine.resume(co)
+  local it = 0
+  while coroutine.status(co) ~= "dead" and it < 8000 do
+    it = it + 1
+    for _ = 1, math.max(1, math.floor((tonumber(dt) or 0.25) / 0.05)) do dr.stepTick() end
+    ck.advance(tonumber(dt) or 0.25)
+    serviceQueen()
+    local msg = table.remove(dIn, 1)
+    if msg then ok, dt = coroutine.resume(co, "modem_message", "q", "q", hxnet.PORT, 5, msg)
+    else ok, dt = coroutine.resume(co, nil) end
+    if not ok then error(dt) end
+    if w.chestGet(30, 64, 0) >= 64 then break end
+  end
+  check("courier ferried 64 items to the destination", w.chestGet(30, 64, 0) == 64, w.chestGet(30, 64, 0))
+  check("courier drew from the source", w.chestGet(10, 64, 0) == 36, w.chestGet(10, 64, 0))
+end
+
+-- farmer: harvest + replant a mature field ---------------------------------
+
+do
+  local w = hivesim.world{ surface = hivesim.terrain.plains(5) }
+  for x = 0, 2 do for z = 0, 2 do w.place(x, 10, z, "wheat_ready") end end
+  local ck = hivesim.clock()
+  local robot = hivesim.robot(w, -1, 11, 0, { dig = true })
+  local farmer = require("farmer")
+  local rsdk = require("robot_sdk")
+  local reg = registryLib.new{ store = store.new{ fs = hivesim.memfs() }, now = ck.now }
+  local qIn, dIn, assigned = {}, {}, false
+  local qnet = netshim.new{ id = 0, master = master, hmac = fakeHmac, now = ck.now, epoch = 2,
+    send = function(wire) dIn[#dIn + 1] = wire end }
+  qnet.onHello(function(id, info)
+    reg.join(id, { role = "farmer", kind = "robot", caps = { "farm" } })
+    qnet.welcome(id, info.nonce, id, 0, 0, 64, 0, 1)
+  end)
+  qnet.onTelem(function(id, b) reg.upsertBeacon(id, b) end)
+  qnet.onEvt(function() end)
+  local ctx = {
+    id = 12, key = hxnet.deriveKey(master, 12, fakeHmac), hmac = fakeHmac, now = ck.now,
+    role = 5, fw = 1, nonce = "farmer01", queen = { x = 0, y = 64, z = 0 }, home = { x = -1, y = 11, z = 0 },
+    send = function(wire) qIn[#qIn + 1] = wire end,
+    pull = function(t) return coroutine.yield(t) end,
+    navPos = function() return robot.pos() end,
+    moveStep = function(dx, dy, dz) return robot.moveStep(dx, dy, dz) end,
+    dig = function(dx, dy, dz) return robot.dig(dx, dy, dz) end,
+    detect = function(dx, dy, dz) return robot.detect(dx, dy, dz) end,
+    place = function(dx, dy, dz) return robot.place(dx, dy, dz, "wheat") end,
+    energy = function() return robot.energyFrac() end,
+  }
+  local function harvested()
+    local n = 0
+    for x = 0, 2 do for z = 0, 2 do if w.blockName(x, 10, z) == "wheat" then n = n + 1 end end end
+    return n
+  end
+  local function serviceQueen()
+    while #qIn > 0 do qnet.submit("d", 5, table.remove(qIn, 1)) end
+    for id, d in pairs(reg.all()) do
+      if (d.state == hxnet.STATE.IDLE or d.state == "idle") and not d.taskId and not assigned then
+        local task = { type = "farm_pass", params = { x = 0, y = 10, z = 0, w = 3, l = 3 } }
+        local area = { x1 = 0, z1 = 0, x2 = 2, z2 = 2, y1 = 10, y2 = 10 }
+        reg.setTask(id, "P1"); assigned = true
+        qnet.cmd(id, hxnet.CMD.ASSIGN, rsdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.FARM, area, 900))
+      end
+    end
+  end
+  local co = coroutine.create(function() rsdk.main(farmer, ctx) end)
+  local ok, dt = coroutine.resume(co)
+  local it = 0
+  while coroutine.status(co) ~= "dead" and it < 4000 do
+    it = it + 1
+    ck.advance(tonumber(dt) or 0.2)
+    serviceQueen()
+    local msg = table.remove(dIn, 1)
+    if msg then ok, dt = coroutine.resume(co, "modem_message", "q", "q", hxnet.PORT, 5, msg)
+    else ok, dt = coroutine.resume(co, nil) end
+    if not ok then error(dt) end
+    if assigned and harvested() == 9 then break end
+    if it > 2500 then break end
+  end
+  check("farmer harvested + replanted all 9 crops", harvested() == 9, harvested())
+end
+
 print(string.rep("-", 40))
 if failures == 0 then print("all role tests passed"); os.exit(0)
 else print(failures .. " test(s) failed"); os.exit(1) end

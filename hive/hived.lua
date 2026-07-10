@@ -46,6 +46,14 @@ local function encodeAssignment(d, task)
   elseif task.type == "mine_vein" then
     local area = { x1 = p.x - 8, z1 = p.z - 8, x2 = p.x + 8, z2 = p.z + 8, y1 = p.y - 8, y2 = p.y + 8 }
     return robotSdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.DESTRUCTION, area, 600)
+  elseif task.type == "farm_pass" then
+    local area = { x1 = p.x, z1 = p.z, x2 = p.x + p.w - 1, z2 = p.z + p.l - 1, y1 = p.y, y2 = p.y }
+    return robotSdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.FARM, area, 900)
+  elseif task.type == "ferry" then
+    local f, to = p.from, p.to
+    local area = { x1 = math.min(f.x, to.x), z1 = math.min(f.z, to.z),
+      x2 = math.max(f.x, to.x), z2 = math.max(f.z, to.z) }
+    return droneSdk.encodeTask(task) .. hxnet.pack.grant(hxnet.MODE.TRANSPORT, area, 600)
   end
   -- scan_tile (drone): SCOUT over the whole tile column
   local cx, cz = p.cx or 0, p.cz or 0
@@ -281,6 +289,58 @@ local function cmdMine(a)
   end
 end
 
+local function cmdFerry(a)
+  local svc = svcHandle()
+  local n = {}
+  for i = 2, 8 do n[i] = tonumber(a[i]) end
+  if not (n[2] and n[3] and n[4] and n[5] and n[6] and n[7]) then
+    print("usage: hived ferry <fromX fromY fromZ> <toX toY toZ> [count]"); return
+  end
+  svc.tasker.submit{ type = "ferry", needs = { "courier" },
+    params = { from = { x = n[2], y = n[3], z = n[4] }, to = { x = n[5], y = n[6], z = n[7] },
+      count = tonumber(a[8]) or 64 },
+    startPos = { x = n[2], y = n[3], z = n[4] } }
+  if not shared.svc then svc.tasker.checkpoint() end
+  print("Queued a ferry job.")
+end
+
+local function cmdFarm(a)
+  local svc = svcHandle()
+  local x, y, z, w, l = tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), tonumber(a[5]), tonumber(a[6])
+  if not (x and y and z and w and l) then print("usage: hived farm <cornerX cropY cornerZ> <w> <l>"); return end
+  svc.tasker.submit{ type = "farm_pass", needs = { "farm" }, recur = { every = 1800 },
+    params = { x = x, y = y, z = z, w = w, l = l }, startPos = { x = x, y = y + 1, z = z } }
+  if not shared.svc then svc.tasker.checkpoint() end
+  print("Queued a recurring farm pass (every 30 min).")
+end
+
+local function cmdHole(a)
+  local svc = svcHandle()
+  local x, z, yTop, yBot = tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), tonumber(a[5])
+  if not (x and z and yTop and yBot) then print("usage: hived hole <x> <z> <yTop> <yBot> [type]"); return end
+  local ttype = svc.navgraph.TTYPE and svc.navgraph.TTYPE[(a[6] or "hole3"):upper()] or nil
+  local top, bot = svc.navgraph.addHole{ x = x, z = z, yTop = yTop, yBot = yBot, ttype = ttype }
+  svc.navgraph.save()
+  print(("Added a %s hole entry (nodes %d/%d) at %d,%d down to y=%d."):format(
+    a[6] or "hole3", top, bot, x, z, yBot))
+end
+
+local function cmdTunnel(a)
+  local svc = svcHandle()
+  local ng = svc.navgraph
+  local n = {}
+  for i = 2, 7 do n[i] = tonumber(a[i]) end
+  if not (n[2] and n[4] and n[5] and n[7]) then
+    print("usage: hived tunnel <x1 y1 z1> <x2 y2 z2> [type]"); return
+  end
+  local A = ng.addNode{ kind = ng.KIND.JUNCTION, x = n[2], y = n[3], z = n[4] }
+  local B = ng.addNode{ kind = ng.KIND.JUNCTION, x = n[5], y = n[6], z = n[7] }
+  local ttype = ng.TTYPE[(a[8] or "standard"):upper()]
+  ng.link(A, B, ng.MODE.TUNNEL, nil, ttype)
+  ng.save()
+  print(("Linked a %s tunnel between junctions %d and %d."):format(a[8] or "standard", A, B))
+end
+
 -- --- dispatch --------------------------------------------------------------
 
 local args = { ... }
@@ -291,7 +351,14 @@ elseif cmd == "status" then cmdStatus()
 elseif cmd == "survey" then cmdSurvey()
 elseif cmd == "scan" then cmdScan(args)
 elseif cmd == "mine" then cmdMine(args)
+elseif cmd == "ferry" then cmdFerry(args)
+elseif cmd == "farm" then cmdFarm(args)
+elseif cmd == "hole" then cmdHole(args)
+elseif cmd == "tunnel" then cmdTunnel(args)
 else
   print("hived - hive queen daemon")
-  print("usage: hived init | run | status | survey | scan <x1 z1 x2 z2> | mine <x1 y1 z1 x2 y2 z2>")
+  print("usage: hived init | run | status | survey")
+  print("       scan <x1 z1 x2 z2> | mine <x1 y1 z1 x2 y2 z2>")
+  print("       ferry <fx fy fz tx ty tz [n]> | farm <x y z w l>")
+  print("       hole <x z yTop yBot [type]> | tunnel <x1 y1 z1 x2 y2 z2 [type]>")
 end

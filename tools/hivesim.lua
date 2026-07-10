@@ -159,8 +159,17 @@ function hivesim.world(opts)
     return n == "water" or n == "lava"
   end
 
-  function w.dig(x, y, z) w.dug[key(x, y, z)] = true end
-  function w.place(x, y, z, name) w.placed[key(x, y, z)] = name or "stone" end
+  function w.dig(x, y, z) w.dug[key(x, y, z)] = true; w.placed[key(x, y, z)] = nil end
+  function w.place(x, y, z, name)
+    local k = key(x, y, z)
+    w.placed[k] = name or "stone"
+    w.dug[k] = nil -- placing a block un-digs the cell
+  end
+
+  -- chest inventories (generic item count) for courier logistics tests
+  function w.chestGet(x, y, z) return w.chests[key(x, y, z)] or 0 end
+  function w.chestSet(x, y, z, n) w.chests[key(x, y, z)] = n end
+  function w.chestAdd(x, y, z, n) w.chests[key(x, y, z)] = (w.chests[key(x, y, z)] or 0) + n end
 
   return w
 end
@@ -236,6 +245,23 @@ function hivesim.drone(world, x, y, z, opts)
   end
   function d.energyFrac() return d.energy end
 
+  -- inventory upgrade: suck from / drop to the chest one block below the drone
+  d.inv, d.cap = 0, opts.cap or 512
+  function d.invCount() return d.inv end
+  function d.suckBelow(world)
+    local x, y, z = d.pos()
+    if not x then return 0 end
+    local take = math.min(world.chestGet(x, y - 1, z), d.cap - d.inv)
+    world.chestAdd(x, y - 1, z, -take); d.inv = d.inv + take
+    return take
+  end
+  function d.dropBelow(world)
+    local x, y, z = d.pos()
+    if not x then return 0 end
+    local n = d.inv; world.chestAdd(x, y - 1, z, n); d.inv = 0
+    return n
+  end
+
   local function cellSolid(fx, fy, fz)
     return world.isSolid(floor(fx + 0.5), floor(fy + 0.5), floor(fz + 0.5))
   end
@@ -287,6 +313,10 @@ function hivesim.robot(world, x, y, z, opts)
   end
   function r.dig(dx, dy, dz)
     world.dig(r.x + dx, r.y + dy, r.z + dz)
+    return true
+  end
+  function r.place(dx, dy, dz, name)
+    world.place(r.x + dx, r.y + dy, r.z + dz, name or "wheat")
     return true
   end
   return r

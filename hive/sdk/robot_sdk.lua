@@ -12,8 +12,8 @@ local navcore = require("navcore")
 
 local sdk = {}
 
--- Task codec (queen ASSIGN <-> robot). type 3 = mine_slab; 4 = mine_vein.
-local TASK = { MINE_SLAB = 3, MINE_VEIN = 4 }
+-- Task codec (queen ASSIGN <-> robot). 3 = mine_slab; 4 = mine_vein; 5 = farm_pass.
+local TASK = { MINE_SLAB = 3, MINE_VEIN = 4, FARM_PASS = 5 }
 sdk.TASK = TASK
 
 function sdk.encodeTask(t)
@@ -23,6 +23,8 @@ function sdk.encodeTask(t)
   elseif t.type == "mine_vein" then
     local s = p.seedPos or p
     return string.pack("<Bi2i2i2", TASK.MINE_VEIN, s.x, s.y, s.z)
+  elseif t.type == "farm_pass" then
+    return string.pack("<Bi2i2i2BB", TASK.FARM_PASS, p.x, p.y, p.z, p.w, p.l)
   end
   return string.pack("<B", 0)
 end
@@ -35,6 +37,9 @@ local function decodeTask(payload)
   elseif tt == TASK.MINE_VEIN then
     local _, x, y, z = string.unpack("<Bi2i2i2", payload)
     return { type = "mine_vein", x = x, y = y, z = z }, 7
+  elseif tt == TASK.FARM_PASS then
+    local _, x, y, z, w, l = string.unpack("<Bi2i2i2BB", payload)
+    return { type = "farm_pass", x = x, y = y, z = z, w = w, l = l }, 9
   end
   return nil, 1
 end
@@ -71,7 +76,8 @@ function sdk.main(role, ctx)
   end
   local function canDig(x, y, z)
     local g = state.grant
-    if not g or g.mode ~= hxnet.MODE.DESTRUCTION or not canOperate(x, z) then return false end
+    if not g or not canOperate(x, z) then return false end
+    if g.mode ~= hxnet.MODE.DESTRUCTION and g.mode ~= hxnet.MODE.FARM then return false end
     return y >= math.min(g.area.y1, g.area.y2) and y <= math.max(g.area.y1, g.area.y2)
   end
   local function enforcedDig(dx, dy, dz)

@@ -25,8 +25,12 @@ local TASK = { SCAN_TILE = 1, FERRY = 2 }
 sdk.TASK = TASK
 
 function sdk.encodeTask(t)
+  local p = t.params or t
   if t.type == "scan_tile" then
-    return string.pack("<Bi2i2", TASK.SCAN_TILE, t.cx or t.params.cx, t.cz or t.params.cz)
+    return string.pack("<Bi2i2", TASK.SCAN_TILE, t.cx or p.cx, t.cz or p.cz)
+  elseif t.type == "ferry" then
+    local f, to = p.from, p.to
+    return string.pack("<Bi2i2i2i2i2i2I2", TASK.FERRY, f.x, f.y, f.z, to.x, to.y, to.z, p.count or 64)
   end
   return string.pack("<B", 0)
 end
@@ -37,6 +41,10 @@ local function decodeTask(payload)
   if tt == TASK.SCAN_TILE then
     local _, cx, cz = string.unpack("<Bi2i2", payload)
     return { type = "scan_tile", cx = cx, cz = cz }, 5
+  elseif tt == TASK.FERRY then
+    local _, fx, fy, fz, tx, ty, tz, count = string.unpack("<Bi2i2i2i2i2i2I2", payload)
+    return { type = "ferry", from = { x = fx, y = fy, z = fz }, to = { x = tx, y = ty, z = tz },
+      count = count }, 15
   end
   return nil, 1
 end
@@ -228,6 +236,11 @@ function sdk.main(role, ctx)
 
   function api.uploadScan(batch) if batch and #batch > 0 then sendEvt(hxnet.EVT.SCAN, batch) end end
 
+  -- courier inventory helpers (drone hovers 1 above the target inventory)
+  function api.suckBelow() return ctx.suck and ctx.suck() or 0 end
+  function api.dropBelow() return ctx.drop and ctx.drop() or 0 end
+  function api.invCount() return ctx.invCount and ctx.invCount() or 0 end
+
   -- --- command dispatch ----------------------------------------------------
 
   local function setGrant(mode, area, ttl)
@@ -382,6 +395,13 @@ function sdk.mainFromComponents(role)
     droneMove = function(dx, dy, dz) drone.move(dx, dy, dz) end,
     droneOffset = function() return drone.getOffset() end,
     geoScan = function(rx, rz, ry, w, d, h) return geo and geo.scan(rx, rz, ry, w, d, h) or {} end,
+    -- inventory upgrade: suck from / drop to the block below (side 0 = down)
+    suck = function() local inv = component.list("inventory_controller")(); if inv then
+      local before = drone.count and drone.count() or 0
+      drone.suck(0); return (drone.count and drone.count() or 0) - before
+    end return drone.suck and drone.suck(0) or 0 end,
+    drop = function() return drone.drop and drone.drop(0) or 0 end,
+    invCount = function() return drone.count and drone.count() or 0 end,
     energy = function() return computer.energy() / computer.maxEnergy() end,
     setStatus = function(l1, l2) pcall(drone.setStatusText, ((l1 or "") .. "\n" .. (l2 or "")):sub(1, 21)) end,
     setLight = function(rgb) pcall(drone.setLightColor, rgb) end,
