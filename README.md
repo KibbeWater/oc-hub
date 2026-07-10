@@ -265,16 +265,27 @@ A modern rewrite of the classic NoteblockPlayer.
 ### Usage
 
 ```
-noteblock                            browse/search noteblock.world (needs internet card)
+noteblock                            touch GUI: browse/search noteblock.world
+noteblock --cli                      the classic text browser instead
 noteblock play <file|url|id> [...]   play local .nbs files or nbw songs
 noteblock search tetris              quick search with ids
 noteblock players                    list discovered player nodes
 noteblock stop                       stop all nodes
 ```
 
-Playback keys: `[space]` pause/resume, `[q]` stop. Downloads are cached in
-`/home/music/`. All NBS versions parse (classic v0 through OpenNBS v5),
-including tempo changers, per-note velocity and detune.
+The GUI (tier 2+ screens get taps and drag-scrolling; keyboards work
+everywhere: `n`/`p` pages, `s` search, `q` quit, `[space]`/`[q]` during
+playback) has Recent/Featured/Search/Local tabs, per-song download
+progress bars, and a Now Playing screen with pause/stop buttons. It's
+built on `/usr/lib/ocui.lua`, a small reusable touch-first widget toolkit
+(labels, buttons, scrollable lists, progress bars) you can use for your
+own programs.
+
+Speed: songs are cached in `/home/music/` by id, so replays never touch
+the network; the next browse page is prefetched in the background while
+you read the current one; downloads show live progress. All NBS versions
+parse (classic v0 through OpenNBS v6), including tempo changers, per-note
+velocity and detune.
 
 ### Keeping the fleet up to date
 

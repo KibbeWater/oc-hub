@@ -6,7 +6,7 @@
 -- trigger costs ~1 game tick, more players means denser songs play clean.
 --
 -- Usage:
---   noteblock                       browse noteblock.world interactively
+--   noteblock                       touch GUI browser (or text UI with --cli)
 --   noteblock play <target> [...]   play files/URLs/noteblock.world ids
 --   noteblock search <words...>     quick search
 --   noteblock players               list available player nodes
@@ -42,6 +42,9 @@ local nbs = require("nbs")
 local serialization = require("serialization")
 local shell = require("shell")
 local term = require("term")
+
+local haveUI, ocui = pcall(require, "ocui")
+if not haveUI then ocui = nil end
 
 local API = "https://api.noteblock.world/v1"
 local MUSIC_DIR = "/home/music"
@@ -85,7 +88,9 @@ end
 
 ------------------------------------------------------------------- http --
 
-local function fetch(url, headers)
+-- onProgress(bytesReceived, totalOrNil) is called per chunk; the total
+-- comes from the Content-Length response header when the server sends it.
+local function fetch(url, headers, onProgress)
   local ok, req = pcall(internet.request, url, nil, headers)
   if not ok then return nil, tostring(req) end
   local deadline = computer.uptime() + 30
@@ -97,11 +102,22 @@ local function fetch(url, headers)
     if computer.uptime() > deadline then return nil, "connection timed out" end
     os.sleep(0.05)
   end
-  local code, message = req.response()
+  local code, message, respHeaders = req.response()
+  local total
+  if type(respHeaders) == "table" then
+    for name, value in pairs(respHeaders) do
+      if tostring(name):lower() == "content-length" then
+        total = tonumber(type(value) == "table" and value[1] or value)
+      end
+    end
+  end
   local chunks = {}
+  local received = 0
   local readOk, readErr = pcall(function()
     for chunk in req do
       chunks[#chunks + 1] = chunk
+      received = received + #chunk
+      if onProgress then onProgress(received, total) end
     end
   end)
   if code and (code < 200 or code >= 300) then
@@ -157,31 +173,44 @@ local function zipInflater()
   end
 end
 
--- Downloads a song by public id. Returns path, meta or nil, error.
-local function downloadSong(id)
+-- Downloads a song by public id. Songs are cached in /home/music keyed
+-- by id, so repeat plays skip the network entirely.
+-- hooks = { status = fn(text), progress = fn(bytes, total) } (optional).
+-- Returns path, meta or nil, error.
+local function downloadSong(id, hooks)
+  local function report(text)
+    if hooks and hooks.status then hooks.status(text) else print(text) end
+  end
+
+  if fs.isDirectory(MUSIC_DIR) then
+    local pattern = "%." .. id:gsub("(%W)", "%%%1") .. "%.nbs$"
+    for entry in fs.list(MUSIC_DIR) do
+      if entry:match(pattern) then
+        report("using cached copy")
+        return fs.concat(MUSIC_DIR, entry), nil
+      end
+    end
+  end
+
   ensureInternet()
   local meta = apiJson(API .. "/song/" .. id) or {}
-  io.write("fetching download link... ")
+  report("fetching download link...")
   local url, err = fetch(API .. "/song/" .. id .. "/open",
     { ["User-Agent"] = UA["User-Agent"], src = "downloadButton" })
   if not url then
-    print("failed")
     return nil, "cannot get song from noteblock.world: " .. tostring(err)
   end
   url = url:gsub("^%s*\"?", ""):gsub("\"?%s*$", "")
-  print("ok")
-  io.write("downloading song... ")
-  local zip, zerr = fetch(url)
+  report("downloading song...")
+  local zip, zerr = fetch(url, nil, hooks and hooks.progress)
   if not zip then
-    print("failed")
     return nil, "download failed: " .. tostring(zerr)
   end
   local data, uerr = nbs.unzip(zip, "%.nbs$", zipInflater())
   if not data then
-    print("failed")
     return nil, tostring(uerr)
   end
-  printf("ok (%d bytes)", #data)
+  report(string.format("downloaded %d KB", math.floor(#data / 1024)))
 
   fs.makeDirectory(MUSIC_DIR)
   local base = sanitizeName(meta.title)
@@ -394,6 +423,12 @@ local function runPlayback(session)
 
   local function drawProgress()
     local e = math.max(0, math.min(elapsed(), session.duration))
+    if session.gui then
+      session.gui.bar:setValue(e / math.max(1, session.duration))
+      session.gui.timeLabel:setText(string.format("%s / %s%s",
+        fmtTime(e), fmtTime(session.duration), paused and "  paused" or ""))
+      return
+    end
     local label = string.format(" %s/%s %s", fmtTime(e),
       fmtTime(session.duration), paused and "|| paused" or "")
     local barWidth = math.max(10, width - #label - 3)
@@ -418,30 +453,45 @@ local function runPlayback(session)
         end
       end
 
-      local sig = table.pack(event.pull(timeout))
-      if sig[1] == "interrupted" then -- Ctrl+C stops like [q]
+      local action
+      if session.gui then
+        local kind, char = session.gui.ui:pump(timeout)
+        if kind == "quit" then action = "stop" end
+        if kind == "key" then
+          if char == 32 then action = "toggle"
+          elseif char == 113 or char == 81 then action = "stop" end
+        end
+        if session.gui.control.action then
+          action = session.gui.control.action
+          session.gui.control.action = nil
+        end
+      else
+        local sig = table.pack(event.pull(timeout))
+        if sig[1] == "interrupted" then action = "stop" end
+        if sig[1] == "key_down" then
+          if sig[3] == 32 then action = "toggle"
+          elseif sig[3] == 113 or sig[3] == 81 then action = "stop" end
+        end
+      end
+      if action == "stop" then -- [q], Ctrl+C, or the stop button
         stopped = true
         return
-      end
-      if sig[1] == "key_down" then
-        local char = sig[3]
-        if char == 32 then -- space
-          if paused then
-            if session.modem then
-              session.modem.broadcast(port, PROTOCOL, "resume")
-            end
-            start = start + (computer.uptime() - pausedAt)
-            paused = false
-          else
-            if session.modem then
-              session.modem.broadcast(port, PROTOCOL, "pause")
-            end
-            pausedAt = computer.uptime()
-            paused = true
+      elseif action == "toggle" then
+        if paused then
+          if session.modem then
+            session.modem.broadcast(port, PROTOCOL, "resume")
           end
-        elseif char == 113 or char == 81 then -- q/Q
-          stopped = true
-          return
+          start = start + (computer.uptime() - pausedAt)
+          paused = false
+        else
+          if session.modem then
+            session.modem.broadcast(port, PROTOCOL, "pause")
+          end
+          pausedAt = computer.uptime()
+          paused = true
+        end
+        if session.gui then
+          session.gui.pauseButton:setText(paused and " > Resume " or " || Pause ")
         end
       end
 
@@ -473,21 +523,36 @@ local function runPlayback(session)
     pcall(bank.rs.setOutput, nbs.maskToSides(0))
   end
   drawProgress()
-  print("")
+  if not session.gui then print("") end
   if not ok and err ~= nil and not tostring(err):match("interrupted") then
     error(err, 0)
   end
   return not stopped and ok
 end
 
-local function playFile(path)
+local function playFile(path, gui)
+  -- status routing: CLI prints, GUI updates its status label; errors
+  -- return to the GUI instead of exiting the program
+  local function say(fmt, ...)
+    local text = string.format(fmt, ...)
+    if gui then gui.log(text) else printf("%s", text) end
+  end
+  local function abort(msg)
+    if gui then
+      gui.log("error: " .. tostring(msg))
+      return false
+    end
+    fail(msg)
+  end
+
   local f, err = io.open(path, "rb")
-  if not f then fail("cannot open " .. path .. ": " .. tostring(err)) end
+  if not f then return abort("cannot open " .. path .. ": " .. tostring(err)) end
   local data = f:read("*a")
   f:close()
 
+  say("parsing song...")
   local song, perr = nbs.parse(data)
-  if not song then fail(perr) end
+  if not song then return abort(perr) end
   local events, duration = nbs.timeline(song)
 
   -- assemble players: this computer's blocks + discovered remote nodes
@@ -504,19 +569,20 @@ local function playFile(path)
   end
   local modem = openModem()
   if modem then
-    io.write("discovering players... ")
+    say("discovering players...")
     local nodes = discoverPlayers(modem)
-    printf("%d found", #nodes)
+    say("%d player node(s) found", #nodes)
     for _, node in ipairs(nodes) do
       players[#players + 1] = { inst = node.inst, banks = node.banks }
       remote[#players] = node.addr
     end
   end
   if #players == 0 then
-    fail("no note blocks available: calibrate this computer with"
+    return abort("no note blocks available: calibrate this computer with"
       .. " 'noteplayer calibrate' or start remote 'noteplayer' nodes")
   end
 
+  say("scheduling...")
   local assignments, stats, tunings = nbs.schedule(events, players, {
     perTick = tonumber(opts.pertick) or 1,
     fallback = not opts.nofallback,
@@ -531,20 +597,29 @@ local function playFile(path)
 
   local title = song.name ~= "" and song.name or fs.name(path)
   local author = song.author ~= "" and song.author or song.originalAuthor
-  print("")
-  printf("Song:     %s%s", title, author ~= "" and (" - " .. author) or "")
-  printf("Length:   %s   %d notes   %.4g t/s   NBS v%d",
-    fmtTime(duration), song.noteCount, song.tempo, song.version)
-  printf("Players:  %d (%d note blocks)%s", #players, totalBlocks,
-    localIndex and ", including this computer" or "")
-  local lost = stats.dropped
-  printf("Schedule: %d play (%d banked, %d slightly late), %d merged,"
-    .. " %d dropped (%.1f%%), %d substituted",
-    stats.played, stats.bank, stats.late, stats.merged, lost,
-    stats.total > 0 and (100 * lost / stats.total) or 0, stats.substituted)
-  if lost > stats.total * 0.1 then
-    print("          (add more players, note blocks, redstone banks,"
-      .. " or raise --slack)")
+  if gui then
+    if gui.setTitle then gui.setTitle(title, author) end
+    if gui.setInfo then
+      gui.setInfo(string.format("%s | %d notes | %d players | %d dropped%s",
+        fmtTime(duration), song.noteCount, #players, stats.dropped,
+        stats.bank > 0 and (" | " .. stats.bank .. " banked") or ""))
+    end
+  else
+    print("")
+    printf("Song:     %s%s", title, author ~= "" and (" - " .. author) or "")
+    printf("Length:   %s   %d notes   %.4g t/s   NBS v%d",
+      fmtTime(duration), song.noteCount, song.tempo, song.version)
+    printf("Players:  %d (%d note blocks)%s", #players, totalBlocks,
+      localIndex and ", including this computer" or "")
+    local lost = stats.dropped
+    printf("Schedule: %d play (%d banked, %d slightly late), %d merged,"
+      .. " %d dropped (%.1f%%), %d substituted",
+      stats.played, stats.bank, stats.late, stats.merged, lost,
+      stats.total > 0 and (100 * lost / stats.total) or 0, stats.substituted)
+    if lost > stats.total * 0.1 then
+      print("          (add more players, note blocks, redstone banks,"
+        .. " or raise --slack)")
+    end
   end
 
   -- deliver schedules to remote nodes
@@ -552,10 +627,9 @@ local function playFile(path)
     tostring(title):sub(1, 8))
   for index, addr in pairs(remote) do
     if #assignments[index] > 0 then
-      io.write(string.format("sending %d action(s) to %s... ",
-        #assignments[index] / nbs.RECORD_SIZE, addr:sub(1, 8)))
+      say("sending %d action(s) to %s...",
+        #assignments[index] / nbs.RECORD_SIZE, addr:sub(1, 8))
       if transmit(modem, addr, songId, title, assignments[index]) then
-        io.write("ok")
         -- per-song bank tuning; the node confirms once its blocks are set
         if #tunings[index] > 0 then
           local parts = {}
@@ -573,19 +647,19 @@ local function playFile(path)
               tuned = true
             end
           end
-          io.write(tuned and ", tuned" or ", TUNING TIMED OUT")
+          if not tuned then
+            say("node %s tuning TIMED OUT", addr:sub(1, 8))
+          end
         end
-        print("")
       else
-        print("FAILED (node skipped)")
+        say("node %s FAILED (skipped)", addr:sub(1, 8))
       end
     end
   end
 
   -- tune this computer's own banks (setPitch is ~1 tick per block)
   if localIndex and #tunings[localIndex] > 0 then
-    io.write(string.format("tuning %d local bank block(s)... ",
-      #tunings[localIndex]))
+    say("tuning %d local bank block(s)...", #tunings[localIndex])
     for _, tune in ipairs(tunings[localIndex]) do
       local bank = localBanks[tune.dev]
       local address = bank and bank.sides[tune.side]
@@ -594,10 +668,13 @@ local function playFile(path)
         if proxy then pcall(proxy.setPitch, tune.pitch) end
       end
     end
-    print("ok")
   end
 
-  print("[space] pause  [q] stop")
+  if gui then
+    gui.log("playing")
+  else
+    print("[space] pause  [q] stop")
+  end
   local delay = 1.5
   if modem then
     modem.broadcast(port, PROTOCOL, "play", songId, delay)
@@ -606,6 +683,7 @@ local function playFile(path)
     duration = duration,
     delay = delay,
     modem = modem,
+    gui = gui,
     localBlob = localIndex and #assignments[localIndex] > 0
       and assignments[localIndex] or nil,
     localBlocks = localBlocks,
@@ -683,6 +761,321 @@ local function browse()
       end
     end
   end
+end
+
+-------------------------------------------------------------------- gui --
+
+-- Touch-first interface built on /usr/lib/ocui.lua. Tier 2+ screens get
+-- taps/drag-scrolling; keyboards keep working everywhere. `noteblock
+-- --cli` forces the classic text browser.
+
+local function wantGui()
+  if opts.cli or not ocui then return false end
+  if not (component.isAvailable("gpu") and component.isAvailable("screen")) then
+    return false
+  end
+  local w, h = component.gpu.getResolution()
+  return w >= 40 and h >= 14
+end
+
+-- Full-screen playback view; returns when the song ends or is stopped.
+local function guiPlaySong(ui, item)
+  local theme = ocui.theme
+  ui:clear()
+  ui:add(ocui.label{ x = 1, y = 1, w = ui.w, text = "", bg = theme.accent })
+  ui:add(ocui.label{ x = 2, y = 1, w = ui.w - 2, text = "Now Playing",
+    fg = theme.accentText, bg = theme.accent })
+  local titleLabel = ui:add(ocui.label{ x = 3, y = 3, w = ui.w - 4,
+    text = tostring(item.title or "?") })
+  local authorLabel = ui:add(ocui.label{ x = 3, y = 4, w = ui.w - 4,
+    text = tostring(item.originalAuthor or ""), fg = theme.dim })
+  local infoLabel = ui:add(ocui.label{ x = 3, y = 6, w = ui.w - 4,
+    text = "", fg = theme.dim })
+  local statusLabel = ui:add(ocui.label{ x = 3, y = 7, w = ui.w - 4,
+    text = "starting..." })
+  local bar = ui:add(ocui.progress{ x = 3, y = 9, w = ui.w - 4 })
+  local timeLabel = ui:add(ocui.label{ x = 3, y = 10, w = ui.w - 4,
+    text = "", fg = theme.dim })
+  local control = {}
+  local pauseButton = ui:add(ocui.button{ x = 3, y = 12, w = 12,
+    text = " || Pause ",
+    onTap = function() control.action = "toggle" end })
+  ui:add(ocui.button{ x = 17, y = 12, w = 12, text = " [] Stop ",
+    onTap = function() control.action = "stop" end })
+  ui:draw()
+
+  local gui = {
+    ui = ui,
+    control = control,
+    bar = bar,
+    timeLabel = timeLabel,
+    pauseButton = pauseButton,
+    log = function(text) statusLabel:setText(tostring(text)) end,
+    setInfo = function(text) infoLabel:setText(text) end,
+    setTitle = function(title, author)
+      titleLabel:setText(tostring(title))
+      authorLabel:setText(tostring(author or ""))
+    end,
+  }
+
+  local path = item.path
+  if not path then
+    local derr
+    path, derr = downloadSong(item.publicId, {
+      status = function(text) statusLabel:setText(text) end,
+      progress = function(done, total)
+        if total and total > 0 then
+          bar:setValue(done / total)
+          timeLabel:setText(string.format("%d / %d KB",
+            math.floor(done / 1024), math.floor(total / 1024)))
+        else
+          timeLabel:setText(string.format("%d KB", math.floor(done / 1024)))
+        end
+      end,
+    })
+    if path then
+      bar:setValue(0)
+      timeLabel:setText("")
+    else
+      statusLabel:setText("error: " .. tostring(derr))
+    end
+  end
+  if path then
+    playFile(path, gui)
+    statusLabel:setText("finished - tap anywhere to go back")
+  end
+
+  -- wait for user input (not network noise) before returning
+  while true do
+    local kind, extra = ui:pump(math.huge)
+    if kind == "quit" or kind == "key" or kind == "tap" or kind == "drop" then
+      return
+    end
+    if kind == "other" and type(extra) == "table"
+      and (extra[1] == "touch" or extra[1] == "drop") then
+      return
+    end
+  end
+end
+
+local function guiBrowse()
+  ensureInternet()
+  local ui = ocui.new(component.gpu)
+  local theme = ocui.theme
+  local state = { kind = "recent", page = 1, query = nil }
+  local pageCache = {}
+  local quit = false
+  local pageSize = math.min(100, ui.h - 6)
+  local songList, statusLabel, pageLabel, tabs
+
+  -- background prefetch of the next page while the user reads this one
+  local prefetch = { key = nil, req = nil, chunks = nil, connected = false }
+  local function prefetchCancel()
+    if prefetch.req then pcall(prefetch.req.close) end
+    prefetch.key, prefetch.req, prefetch.chunks = nil, nil, nil
+    prefetch.connected = false
+  end
+  local function prefetchStart(key, url)
+    if pageCache[key] or prefetch.key == key then return end
+    prefetchCancel()
+    local ok, req = pcall(internet.request, url, nil, UA)
+    if ok then
+      prefetch.req, prefetch.key, prefetch.chunks = req, key, {}
+    end
+  end
+  local function prefetchPump()
+    if not prefetch.req then return end
+    if not prefetch.connected then
+      local ok, connected = pcall(prefetch.req.finishConnect)
+      if not ok or connected == nil then return prefetchCancel() end
+      if connected ~= true then return end
+      prefetch.connected = true
+    end
+    for _ = 1, 8 do
+      local ok, chunk = pcall(prefetch.req.read)
+      if not ok then return prefetchCancel() end
+      if chunk == nil then
+        local okJson, data = pcall(json.decode, table.concat(prefetch.chunks))
+        if okJson and type(data) == "table" and data.content then
+          pageCache[prefetch.key] = data
+        end
+        return prefetchCancel()
+      elseif chunk == "" then
+        return
+      end
+      prefetch.chunks[#prefetch.chunks + 1] = chunk
+    end
+  end
+
+  local function cacheKey(kind, query, page)
+    return kind .. ":" .. (query or "") .. ":" .. page
+  end
+  local function listUrl(page)
+    if state.kind == "search" then
+      return API .. "/song/search?q=" .. urlencode(state.query)
+        .. "&page=" .. page .. "&limit=" .. pageSize
+    elseif state.kind == "featured" then
+      return API .. "/song/featured"
+    end
+    return API .. "/song?page=" .. page .. "&limit=" .. pageSize
+  end
+
+  local function loadLocalList()
+    local items = {}
+    if fs.isDirectory(MUSIC_DIR) then
+      for entry in fs.list(MUSIC_DIR) do
+        if entry:match("%.nbs$") then
+          items[#items + 1] = {
+            title = entry:gsub("%.nbs$", ""),
+            path = fs.concat(MUSIC_DIR, entry),
+          }
+        end
+      end
+    end
+    table.sort(items, function(a, b) return a.title < b.title end)
+    return { content = items }
+  end
+
+  local buildLayout, loadPage, setTabs
+
+  setTabs = function()
+    for _, tab in ipairs(tabs) do
+      tab.primary = tab.tabKind == state.kind
+      tab:draw()
+    end
+  end
+
+  loadPage = function()
+    local key = cacheKey(state.kind, state.query, state.page)
+    local data
+    if state.kind == "local" then
+      data = loadLocalList()
+    else
+      data = pageCache[key]
+      if not data then
+        statusLabel:setText("loading...")
+        local err
+        data, err = apiJson(listUrl(state.page))
+        if data and not data.content then data = { content = data } end
+        if not data or not data.content then
+          statusLabel:setText("error: " .. tostring(err or "no results"))
+          return
+        end
+        pageCache[key] = data
+      end
+    end
+    local items = data.content or {}
+    songList:setItems(items)
+    local total = tonumber(data.total)
+    local pages = total and math.max(1, math.ceil(total / pageSize))
+    pageLabel:setText(string.format("  page %d%s  ", state.page,
+      pages and ("/" .. pages) or ""))
+    statusLabel:setText(#items == 0 and "nothing here"
+      or (#items .. " song(s) - tap one to play"))
+    if state.kind == "recent" or state.kind == "search" then
+      prefetchStart(cacheKey(state.kind, state.query, state.page + 1),
+        listUrl(state.page + 1))
+    end
+  end
+
+  local function switchTo(kind, query)
+    prefetchCancel()
+    state = { kind = kind, page = 1, query = query }
+    setTabs()
+    loadPage()
+  end
+
+  buildLayout = function()
+    ui:clear()
+    ui:add(ocui.label{ x = 1, y = 1, w = ui.w, text = "", bg = theme.accent })
+    ui:add(ocui.label{ x = 2, y = 1, w = ui.w - 10,
+      text = "NOTE BLOCK WORLD", fg = theme.accentText, bg = theme.accent })
+    ui:add(ocui.button{ x = ui.w - 7, y = 1, w = 8, text = " Quit ",
+      onTap = function() quit = true end })
+    tabs = {}
+    local x = 2
+    for _, def in ipairs({ { "Recent", "recent" }, { "Featured", "featured" },
+      { "Search", "search" }, { "Local", "local" } }) do
+      local tab = ocui.button{ x = x, y = 2, text = " " .. def[1] .. " ",
+        onTap = function()
+          if def[2] == "search" then
+            local query = ocui.prompt(ui, "Search")
+            ui:draw()
+            if query then switchTo("search", query) end
+          else
+            switchTo(def[2])
+          end
+        end }
+      tab.tabKind = def[2]
+      ui:add(tab)
+      tabs[#tabs + 1] = tab
+      x = x + tab.w + 1
+    end
+    songList = ui:add(ocui.list{ x = 1, y = 4, w = ui.w, h = ui.h - 6,
+      items = {},
+      render = function(item)
+        if item.path then return item.title end
+        return tostring(item.title or "?"),
+          fmtTime(tonumber(item.duration) or 0) .. " "
+          .. tostring(tonumber(item.noteCount) or 0) .. "n"
+      end,
+      onSelect = function(_, item)
+        prefetchCancel()
+        guiPlaySong(ui, item)
+        buildLayout()
+        setTabs()
+        loadPage()
+        ui:draw()
+      end })
+    ui:add(ocui.button{ x = 2, y = ui.h - 1, w = 10, text = " < Prev ",
+      onTap = function()
+        if state.page > 1 then
+          state.page = state.page - 1
+          loadPage()
+        end
+      end })
+    pageLabel = ui:add(ocui.label{ x = 13, y = ui.h - 1, w = 14,
+      text = "", fg = theme.dim })
+    ui:add(ocui.button{ x = 28, y = ui.h - 1, w = 10, text = " Next > ",
+      onTap = function()
+        state.page = state.page + 1
+        loadPage()
+      end })
+    statusLabel = ui:add(ocui.label{ x = 1, y = ui.h, w = ui.w,
+      text = "", fg = theme.dim })
+    ui:draw()
+  end
+
+  buildLayout()
+  setTabs()
+  loadPage()
+  ui:draw()
+
+  while not quit do
+    prefetchPump()
+    local kind, a = ui:pump(0.25)
+    if kind == "quit" then break end
+    if kind == "key" then
+      if a == 113 then break -- q
+      elseif a == 110 then -- n
+        state.page = state.page + 1
+        loadPage()
+      elseif a == 112 and state.page > 1 then -- p
+        state.page = state.page - 1
+        loadPage()
+      elseif a == 115 then -- s
+        local query = ocui.prompt(ui, "Search")
+        ui:draw()
+        if query then switchTo("search", query) end
+      end
+    end
+  end
+  prefetchCancel()
+
+  -- restore a sane terminal
+  component.gpu.setBackground(0x000000)
+  component.gpu.setForeground(0xFFFFFF)
+  term.clear()
 end
 
 ----------------------------------------------------------------- update --
@@ -847,8 +1240,13 @@ elseif command == "stop" then
 elseif command == "update" then
   commandUpdate()
 elseif command == nil then
-  browse()
+  if wantGui() then
+    guiBrowse()
+  else
+    browse()
+  end
 else
-  print("usage: noteblock [play <target>...|search <words>|players|update|stop]")
+  print("usage: noteblock [play <target>...|search <words>|players|update|stop]"
+    .. " [--cli]")
   os.exit(1)
 end
