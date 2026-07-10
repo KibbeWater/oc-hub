@@ -173,10 +173,40 @@ local function zipInflater()
   end
 end
 
+-- Keeps the song cache within ~30% of the drive; oldest files go first.
+local function trimCache(keepPath)
+  local budget = 1024 * 1024
+  local proxy = fs.get(MUSIC_DIR)
+  if proxy and proxy.spaceTotal then
+    local ok, total = pcall(proxy.spaceTotal)
+    if ok and type(total) == "number" then
+      budget = math.max(256 * 1024, math.floor(total * 0.3))
+    end
+  end
+  local files, used = {}, 0
+  for entry in fs.list(MUSIC_DIR) do
+    if entry:match("%.nbs$") then
+      local path = fs.concat(MUSIC_DIR, entry)
+      local size = fs.size(path) or 0
+      files[#files + 1] = { path = path, size = size,
+        at = fs.lastModified(path) or 0 }
+      used = used + size
+    end
+  end
+  table.sort(files, function(a, b) return a.at < b.at end)
+  for _, file in ipairs(files) do
+    if used <= budget then break end
+    if file.path ~= keepPath then
+      fs.remove(file.path)
+      used = used - file.size
+    end
+  end
+end
+
 -- Downloads a song by public id. Songs are cached in /home/music keyed
 -- by id, so repeat plays skip the network entirely.
 -- hooks = { status = fn(text), progress = fn(bytes, total) } (optional).
--- Returns path, meta or nil, error.
+-- Returns path, meta, freshlyDownloaded or nil, error.
 local function downloadSong(id, hooks)
   local function report(text)
     if hooks and hooks.status then hooks.status(text) else print(text) end
@@ -187,7 +217,7 @@ local function downloadSong(id, hooks)
     for entry in fs.list(MUSIC_DIR) do
       if entry:match(pattern) then
         report("using cached copy")
-        return fs.concat(MUSIC_DIR, entry), nil
+        return fs.concat(MUSIC_DIR, entry), nil, false
       end
     end
   end
@@ -220,13 +250,15 @@ local function downloadSong(id, hooks)
   if not f then return nil, "cannot save song: " .. tostring(ferr) end
   f:write(data)
   f:close()
-  return path, meta
+  trimCache(path)
+  return path, meta, true
 end
 
 -- Turns a play target (path, URL, id) into a local .nbs path.
+-- Returns path, freshlyDownloaded.
 local function resolveTarget(target)
   local path = shell.resolve(target)
-  if fs.exists(path) and not fs.isDirectory(path) then return path end
+  if fs.exists(path) and not fs.isDirectory(path) then return path, false end
   local id = target:match("^https?://noteblock%.world/song/([%w_%-]+)")
     or target:match("^nbw:([%w_%-]+)$")
   if not id and target:match("^[%w_%-]+$") and #target >= 8 and #target <= 12
@@ -234,9 +266,9 @@ local function resolveTarget(target)
     id = target
   end
   if id then
-    local path2, derr = downloadSong(id)
+    local path2, derr, fresh = downloadSong(id)
     if not path2 then fail(derr) end
-    return path2
+    return path2, fresh
   end
   if target:match("^https?://") then
     ensureInternet()
@@ -257,7 +289,7 @@ local function resolveTarget(target)
     local f = io.open(dest, "wb")
     f:write(data)
     f:close()
-    return dest
+    return dest, true
   end
   fail("no such file or song: " .. target)
 end
@@ -750,9 +782,12 @@ local function browse()
       local pick = items[tonumber(input) or -1]
       if pick and pick.publicId then
         term.clear()
-        local path, derr = downloadSong(pick.publicId)
+        local path, derr, fresh = downloadSong(pick.publicId)
         if path then
-          playFile(path)
+          if playFile(path) == false and fresh then
+            fs.remove(path)
+            printf("stopped - download not kept")
+          end
         else
           printf("error: %s", tostring(derr))
         end
@@ -826,9 +861,10 @@ local function playerScreen(item)
       }
 
       local path = item.path
+      local fresh = false
       if not path then
         local derr
-        path, derr = downloadSong(item.publicId, {
+        path, derr, fresh = downloadSong(item.publicId, {
           status = function(text) statusLabel:setText(text) end,
           progress = function(done, total)
             if total and total > 0 then
@@ -848,8 +884,15 @@ local function playerScreen(item)
         end
       end
       if path then
-        playFile(path, gui)
-        statusLabel:setText("finished")
+        local finished = playFile(path, gui)
+        if finished == false and fresh then
+          -- a stopped song someone never had before is not worth its
+          -- disk space; only completed plays enter the cache
+          fs.remove(path)
+          statusLabel:setText("stopped - download not kept")
+        else
+          statusLabel:setText(finished == false and "stopped" or "finished")
+        end
       end
 
       -- playback over: swap the controls for Back
@@ -1326,7 +1369,13 @@ local command = args[1]
 if command == "play" then
   if not args[2] then fail("usage: noteblock play <file|url|id> [...]") end
   for i = 2, #args do
-    if not playFile(resolveTarget(args[i])) then break end
+    local path, fresh = resolveTarget(args[i])
+    local finished = playFile(path)
+    if finished == false and fresh then
+      fs.remove(path)
+      printf("stopped - removed the unfinished download from the cache")
+    end
+    if not finished then break end
   end
 elseif command == "search" then
   ensureInternet()
