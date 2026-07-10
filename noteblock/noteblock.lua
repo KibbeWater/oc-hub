@@ -189,14 +189,22 @@ end
 
 ---------------------------------------------------------------- players --
 
-local function loadLocalBlocks()
-  local blocks, counts = {}, {}
+-- Reads this computer's own noteplayer calibration (v1 flat map or v2
+-- {blocks, banks} schema) so the master can play locally too.
+local function loadLocalSetup()
+  local blocks, counts, banks = {}, {}, {}
   local f = io.open(PLAYER_CONFIG, "r")
-  if not f then return blocks, counts end
-  local mapping = serialization.unserialize(f:read("*a") or "") or {}
+  if not f then return blocks, counts, banks end
+  local data = serialization.unserialize(f:read("*a") or "") or {}
   f:close()
-  for address, inst in pairs(mapping) do
-    if component.type(address) == "note_block" then
+  if not data.blocks then data = { blocks = data, banks = {} } end
+  data.banks = data.banks or {}
+  local bankBlocks = {}
+  for _, bank in ipairs(data.banks) do
+    for _, address in pairs(bank.sides) do bankBlocks[address] = true end
+  end
+  for address, inst in pairs(data.blocks) do
+    if not bankBlocks[address] and component.type(address) == "note_block" then
       local proxy = component.proxy(address)
       if proxy then
         blocks[inst] = blocks[inst] or {}
@@ -205,7 +213,19 @@ local function loadLocalBlocks()
       end
     end
   end
-  return blocks, counts
+  for _, bank in ipairs(data.banks) do
+    if component.type(bank.addr) == "redstone" then
+      local proxy = component.proxy(bank.addr)
+      if proxy then
+        local instBySide = {}
+        for side, address in pairs(bank.sides) do
+          instBySide[side] = data.blocks[address]
+        end
+        banks[#banks + 1] = { rs = proxy, sides = bank.sides, inst = instBySide }
+      end
+    end
+  end
+  return blocks, counts, banks
 end
 
 local function openModem()
@@ -225,23 +245,34 @@ local function discoverPlayers(modem)
       math.max(0.05, deadline - computer.uptime()), "modem_message"))
     if sig[1] == "modem_message" and sig[4] == port
       and sig[6] == PROTOCOL and sig[7] == "hello" then
+      local payload = tostring(sig[8])
+      local instPart, bankPart = payload:match("^([^|]*)|?(.*)$")
       local inst = {}
-      for id, count in tostring(sig[8]):gmatch("(%d+):(%d+)") do
+      for id, count in (instPart or ""):gmatch("(%d+):(%d+)") do
         inst[tonumber(id)] = tonumber(count)
       end
-      found[sig[3]] = inst
+      local banks = {}
+      for devPart in (bankPart or ""):gmatch("[^;]+") do
+        local sides, side = {}, 0
+        for token in devPart:gmatch("[^,]+") do
+          if token ~= "-" then sides[side] = tonumber(token) end
+          side = side + 1
+        end
+        banks[#banks + 1] = { inst = sides }
+      end
+      found[sig[3]] = { inst = inst, banks = banks }
     end
   end
   local list = {}
-  for addr, inst in pairs(found) do
-    list[#list + 1] = { addr = addr, inst = inst }
+  for addr, node in pairs(found) do
+    list[#list + 1] = { addr = addr, inst = node.inst, banks = node.banks }
   end
   table.sort(list, function(a, b) return a.addr < b.addr end)
   return list
 end
 
 -- Sends a player's schedule in chunks; retries missing chunks.
-local CHUNK = 4000 -- multiple of nbs.RECORD_SIZE
+local CHUNK = 3996 -- multiple of nbs.RECORD_SIZE
 
 local function transmit(modem, addr, songId, songName, blob)
   local last = math.ceil(#blob / CHUNK)
@@ -296,6 +327,15 @@ local function runPlayback(session)
     if not list or #list == 0 then return end
     ring[inst] = ((ring[inst] or 0) % #list) + 1
     pcall(list[ring[inst]].trigger, pitch)
+  end
+
+  local function execute(kind, a, b)
+    if kind == nbs.KIND_VOLLEY then
+      local bank = session.localBanks and session.localBanks[a + 1]
+      if bank then pcall(bank.rs.setOutput, nbs.maskToSides(b)) end
+    else
+      trigger(kind, a)
+    end
   end
 
   local width = 80
@@ -357,9 +397,9 @@ local function runPlayback(session)
 
       if not paused and session.localBlob then
         while true do
-          local t, inst, pitch = nbs.readRecord(session.localBlob, nextLocal)
+          local t, kind, a, b = nbs.readRecord(session.localBlob, nextLocal)
           if not t or start + t > computer.uptime() then break end
-          trigger(inst, pitch)
+          execute(kind, a, b)
           nextLocal = nextLocal + 1
         end
       end
@@ -378,6 +418,9 @@ local function runPlayback(session)
 
   if (stopped or not ok) and session.modem then
     session.modem.broadcast(port, PROTOCOL, "stop")
+  end
+  for _, bank in ipairs(session.localBanks or {}) do
+    pcall(bank.rs.setOutput, nbs.maskToSides(0))
   end
   drawProgress()
   print("")
@@ -399,10 +442,14 @@ local function playFile(path)
 
   -- assemble players: this computer's blocks + discovered remote nodes
   local players, remote = {}, {}
-  local localBlocks, localCounts = loadLocalBlocks()
+  local localBlocks, localCounts, localBanks = loadLocalSetup()
   local localIndex
-  if next(localCounts) then
-    players[#players + 1] = { inst = localCounts }
+  if next(localCounts) or #localBanks > 0 then
+    local bankSpec = {}
+    for i, bank in ipairs(localBanks) do
+      bankSpec[i] = { inst = bank.inst }
+    end
+    players[#players + 1] = { inst = localCounts, banks = bankSpec }
     localIndex = #players
   end
   local modem = openModem()
@@ -411,7 +458,7 @@ local function playFile(path)
     local nodes = discoverPlayers(modem)
     printf("%d found", #nodes)
     for _, node in ipairs(nodes) do
-      players[#players + 1] = { inst = node.inst }
+      players[#players + 1] = { inst = node.inst, banks = node.banks }
       remote[#players] = node.addr
     end
   end
@@ -420,9 +467,10 @@ local function playFile(path)
       .. " 'noteplayer calibrate' or start remote 'noteplayer' nodes")
   end
 
-  local assignments, stats = nbs.schedule(events, players, {
+  local assignments, stats, tunings = nbs.schedule(events, players, {
     perTick = tonumber(opts.pertick) or 1,
     fallback = not opts.nofallback,
+    rsDelay = tonumber(opts.rsdelay) or 0.1,
   })
 
   local totalBlocks = 0
@@ -439,11 +487,13 @@ local function playFile(path)
   printf("Players:  %d (%d note blocks)%s", #players, totalBlocks,
     localIndex and ", including this computer" or "")
   local lost = stats.dropped
-  printf("Schedule: %d play, %d merged, %d dropped (%.1f%%), %d substituted",
-    stats.played, stats.merged, lost,
+  printf("Schedule: %d play (%d via redstone banks), %d merged,"
+    .. " %d dropped (%.1f%%), %d substituted",
+    stats.played, stats.bank, stats.merged, lost,
     stats.total > 0 and (100 * lost / stats.total) or 0, stats.substituted)
   if lost > stats.total * 0.1 then
-    print("          (add more players/note blocks or raise --pertick)")
+    print("          (add more players, note blocks, redstone banks,"
+      .. " or raise --pertick)")
   end
 
   -- deliver schedules to remote nodes
@@ -451,14 +501,49 @@ local function playFile(path)
     tostring(title):sub(1, 8))
   for index, addr in pairs(remote) do
     if #assignments[index] > 0 then
-      io.write(string.format("sending %d notes to %s... ",
+      io.write(string.format("sending %d action(s) to %s... ",
         #assignments[index], addr:sub(1, 8)))
       if transmit(modem, addr, songId, title, nbs.encodeRecords(assignments[index])) then
-        print("ok")
+        io.write("ok")
+        -- per-song bank tuning; the node confirms once its blocks are set
+        if #tunings[index] > 0 then
+          local parts = {}
+          for _, tune in ipairs(tunings[index]) do
+            parts[#parts + 1] = tune.dev .. ":" .. tune.side .. ":" .. tune.pitch
+          end
+          modem.send(addr, port, PROTOCOL, "tune", songId, table.concat(parts, ","))
+          local deadline = computer.uptime() + 8
+          local tuned = false
+          while computer.uptime() < deadline and not tuned do
+            local sig = table.pack(event.pull(
+              math.max(0.05, deadline - computer.uptime()), "modem_message"))
+            if sig[1] == "modem_message" and sig[3] == addr and sig[4] == port
+              and sig[6] == PROTOCOL and sig[7] == "tuned" and sig[8] == songId then
+              tuned = true
+            end
+          end
+          io.write(tuned and ", tuned" or ", TUNING TIMED OUT")
+        end
+        print("")
       else
         print("FAILED (node skipped)")
       end
     end
+  end
+
+  -- tune this computer's own banks (setPitch is ~1 tick per block)
+  if localIndex and #tunings[localIndex] > 0 then
+    io.write(string.format("tuning %d local bank block(s)... ",
+      #tunings[localIndex]))
+    for _, tune in ipairs(tunings[localIndex]) do
+      local bank = localBanks[tune.dev]
+      local address = bank and bank.sides[tune.side]
+      if address then
+        local proxy = component.proxy(address)
+        if proxy then pcall(proxy.setPitch, tune.pitch) end
+      end
+    end
+    print("ok")
   end
 
   print("[space] pause  [q] stop")
@@ -472,6 +557,7 @@ local function playFile(path)
     modem = modem,
     localBlob = localIndex and nbs.encodeRecords(assignments[localIndex]) or nil,
     localBlocks = localBlocks,
+    localBanks = localBanks,
   })
 end
 

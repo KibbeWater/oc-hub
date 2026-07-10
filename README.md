@@ -278,19 +278,45 @@ including tempo changers, per-note velocity and detune.
 
 ### Why multiple players matter
 
-Each note block `trigger()` costs ~1 game tick, so one computer plays at
-most ~20 notes/second — dense chords choke. The master schedules around
-this: it merges duplicate notes, sorts chords by velocity (loudest win),
-assigns each note only to a node that *has* that instrument (substituting
-or dropping the quietest overflow), and pre-transmits each node's schedule
-so playback needs no coordination traffic. With the test song, one 4-block
+Each note block `trigger()` is a *synchronized* OpenComputers call — it
+parks the machine until the next server tick — so one computer plays at
+most ~20 notes/second and chords smear. The master schedules around this:
+it merges duplicate notes, sorts chords by velocity (loudest win), assigns
+each note only to a node that *has* that instrument (substituting or
+dropping the quietest overflow), and pre-transmits each node's schedule so
+playback needs no coordination traffic. With the test song, one 4-block
 computer drops 39% of notes; four computers drop none. The schedule report
-before playback shows exactly what was dropped, so you know when to add
-nodes, note blocks, or `--pertick=2`.
+before playback shows exactly what was dropped.
 
-Options: `--pertick=N` (notes per node per game tick, default 1),
+### Redstone banks: more speed without more computers
+
+Straight from the OC source: `redstone.setOutput{...}` is also a
+synchronized call (plus a `misc.redstoneDelay` machine pause, 0.1s by
+default), **but one call sets all 6 sides of a device at once** — and a
+note block fires on a redstone rising edge with whatever pitch it already
+has. So: wire note blocks to the sides of Redstone I/O blocks (or the
+computer's redstone card), keep them *also* touching an Adapter, and you
+get a **pre-tuned organ**: up to 6 perfectly simultaneous notes per call,
+~40 notes/s per device-owning machine — 120/s if the server sets
+`misc.redstoneDelay: 0` in `opencomputers.cfg`.
+
+`noteplayer calibrate` maps the banks (it pulses each side and asks which
+block rang). Per song, the master picks the hottest (instrument, pitch)
+pairs, re-tunes the bank blocks through the Adapter, schedules what fits
+onto banks (chords love this) and routes the rest through normal triggers.
+On the test song, adding one 12-channel piano organ to a single computer
+cut drops from 39% to 19%.
+
+Cheap scaling tip: a microcontroller with a wireless card + redstone card
+is a full OC machine with its own call budget — a dirt-cheap bank driver.
+
+Options: `--pertick=N` (trigger notes per node per game tick, default 1),
+`--rsdelay=S` (match the server's `misc.redstoneDelay`, default 0.1),
 `--wait=S` (discovery window), `--nofallback` (drop notes for missing
 instruments instead of substituting), `--port=3001`.
+
+Upgrading from the old NoteblockPlayer: nodes migrate `calibration.dat`
+to `/etc/noteplayer.cfg` automatically the first time `noteplayer` runs.
 
 Test the toolkit on your PC: `lua tools/test_nbs.lua <song.nbs> [packed.zip]`.
 

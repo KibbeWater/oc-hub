@@ -254,28 +254,108 @@ end
 
 -- Distributes events across players honoring instruments and capacity.
 --
--- players: { {inst = {[instrumentId] = blockCount}, ...}, ... }
--- opts.perTick: max notes per player per 50ms game tick (default 1,
---   because each note block trigger costs ~1 game tick to process).
+-- Two ways to make a sound, with different costs (from the OC source):
+--  * note_block.trigger(pitch) - synchronized call, parks the machine for
+--    ~1 game tick. Flexible pitch, but max ~20 notes/s per computer and
+--    chords smear across ticks.
+--  * redstone.setOutput{...} - synchronized call + a machine pause of
+--    misc.redstoneDelay (default 0.1s = 2 ticks), BUT one call sets all
+--    6 sides at once, and a note block fires on a redstone rising edge
+--    with whatever pitch was pre-set. Six pre-tuned note blocks per
+--    redstone device = a perfectly simultaneous 6-note "volley".
+--
+-- players: { {
+--     inst  = {[instrumentId] = blockCount},        -- adapter blocks
+--     banks = { {inst = {[side 0-5] = instrumentId}}, ... }  -- optional
+--   }, ... }
+-- opts.perTick:  max trigger notes per player per game tick (default 1)
 -- opts.fallback: substitute an available instrument when no player has
---   the required one (default true).
+--                the required one (default true)
+-- opts.rsDelay:  the server's misc.redstoneDelay in seconds (default 0.1)
 --
 -- Returns:
---   assignments[playerIndex] = { {t=<seconds>, inst=<id>, p=<1-25>}, ... }
---   stats = { total, played, dropped, merged, substituted }
+--   assignments[playerIndex] = sorted list of
+--     {t=<seconds>, inst=<id>, p=<1-25>}           (trigger note)
+--     {t=<seconds>, volley=true, dev=<n>, mask=<0-63>}  (redstone volley)
+--   stats   = { total, played, dropped, merged, substituted, bank }
+--   tunings[playerIndex] = { {dev=<n>, side=<0-5>, pitch=<1-25>}, ... }
+--     (per-song pitches the player must set on its bank blocks first)
 function nbs.schedule(events, players, opts)
   opts = opts or {}
   local perTick = opts.perTick or 1
   local fallback = opts.fallback ~= false
+  local rsDelay = opts.rsDelay or 0.1
+  local TICK = 0.05
+  local dynCost = TICK / perTick
+  local volleyCost = TICK + rsDelay
 
-  local stats = { total = 0, played = 0, dropped = 0, merged = 0, substituted = 0 }
+  local stats = { total = 0, played = 0, dropped = 0, merged = 0,
+    substituted = 0, bank = 0 }
   local assignments = {}
-  local load = {}
+  local busyUntil = {} -- per player machine: earliest time it is free again
   local anyPlayers = {}
   for i, player in ipairs(players) do
     assignments[i] = {}
-    load[i] = {}
+    busyUntil[i] = 0
     if next(player.inst) then anyPlayers[#anyPlayers + 1] = i end
+  end
+
+  -- pass A: how often each distinct (instrument, pitch) occurs
+  local freq = {}
+  for _, event in ipairs(events) do
+    for _, note in ipairs(event.notes) do
+      local key = note.inst * 32 + nbs.blockPitch(note.key, note.pitch)
+      freq[key] = (freq[key] or 0) + 1
+    end
+  end
+
+  -- collect bank channels and tune them: the hottest (inst, pitch) pairs
+  -- get channels first; surplus channels duplicate the hottest pairs so
+  -- fast repeats can alternate between two devices
+  local channels = {}
+  local byInst = {}
+  local volleys = {} -- volleys[player][dev] = { {t=, chans={side=true}}, ... }
+  for pi, player in ipairs(players) do
+    volleys[pi] = {}
+    for di, dev in ipairs(player.banks or {}) do
+      volleys[pi][di] = {}
+      for side = 0, 5 do
+        local instId = dev.inst and dev.inst[side]
+        if instId then
+          local chan = { player = pi, dev = di, side = side, inst = instId }
+          channels[#channels + 1] = chan
+          byInst[instId] = byInst[instId] or {}
+          table.insert(byInst[instId], chan)
+        end
+      end
+    end
+  end
+
+  local tunings = {}
+  for i = 1, #players do tunings[i] = {} end
+  local bankFor = {} -- [inst*32+pitch] = {channel, ...}
+  for instId, list in pairs(byInst) do
+    local pairsOf = {}
+    for key, count in pairs(freq) do
+      if math.floor(key / 32) == instId then
+        pairsOf[#pairsOf + 1] = { key = key, count = count }
+      end
+    end
+    table.sort(pairsOf, function(a, b)
+      if a.count ~= b.count then return a.count > b.count end
+      return a.key < b.key
+    end)
+    if #pairsOf > 0 then
+      for i, chan in ipairs(list) do
+        local pair = pairsOf[((i - 1) % #pairsOf) + 1]
+        chan.pitch = pair.key % 32
+        chan.state = "off"
+        bankFor[pair.key] = bankFor[pair.key] or {}
+        table.insert(bankFor[pair.key], chan)
+        table.insert(tunings[chan.player],
+          { dev = chan.dev, side = chan.side, pitch = chan.pitch })
+      end
+    end
   end
 
   local capable = {}
@@ -302,8 +382,18 @@ function nbs.schedule(events, players, opts)
     return best
   end
 
+  -- a new volley powers exactly its own sides, so every channel the
+  -- device previously held high gets its rising edge back
+  local function resetDevice(pi, di)
+    for _, chan in ipairs(channels) do
+      if chan.player == pi and chan.dev == di and chan.state == "on" then
+        chan.state = "off"
+      end
+    end
+  end
+
   for _, event in ipairs(events) do
-    local slot = math.floor(event.time * 20) -- 50ms game-tick buckets
+    local t = event.time
 
     -- dedupe identical (instrument, pitch) notes; they sound the same
     local seen, list = {}, {}
@@ -322,68 +412,139 @@ function nbs.schedule(events, players, opts)
     table.sort(list, function(a, b) return a.vel > b.vel end)
 
     for _, note in ipairs(list) do
-      local candidates = playersFor(note.inst)
-      local substituted = false
-      if #candidates == 0 and fallback then
-        candidates = playersFor(0)
-        if #candidates == 0 then candidates = anyPlayers end
-        substituted = true
-      end
+      local placed = false
 
-      local best, bestLoad
-      for _, pi in ipairs(candidates) do
-        local l = load[pi][slot] or 0
-        if l < perTick and (not best or l < bestLoad) then
-          best, bestLoad = pi, l
+      -- 1) a pre-tuned redstone channel, if one is free: perfectly
+      --    simultaneous and it can join a volley that is already firing
+      for _, chan in ipairs(bankFor[note.inst * 32 + note.p] or {}) do
+        if chan.state == "off" then
+          local devVolleys = volleys[chan.player][chan.dev]
+          local last = devVolleys[#devVolleys]
+          if last and math.abs(last.t - t) < 0.001 then
+            if not last.chans[chan.side] then
+              last.chans[chan.side] = true
+              chan.state = "on"
+              placed = true
+            end
+          elseif (not last or t - last.t >= volleyCost - 1e-9)
+            and busyUntil[chan.player] <= t + 1e-9 then
+            resetDevice(chan.player, chan.dev)
+            devVolleys[#devVolleys + 1] = { t = t, chans = { [chan.side] = true } }
+            chan.state = "on"
+            busyUntil[chan.player] = t + volleyCost
+            placed = true
+          end
         end
+        if placed then break end
       end
-
-      if best then
-        load[best][slot] = (load[best][slot] or 0) + 1
-        local inst = note.inst
-        if substituted then
-          inst = substituteFor(best)
-          stats.substituted = stats.substituted + 1
-        end
-        local a = assignments[best]
-        a[#a + 1] = { t = event.time, inst = inst, p = note.p }
+      if placed then
+        stats.bank = stats.bank + 1
         stats.played = stats.played + 1
       else
-        stats.dropped = stats.dropped + 1
+        -- 2) a dynamic note block via adapter trigger
+        local candidates = playersFor(note.inst)
+        local substituted = false
+        if #candidates == 0 and fallback then
+          candidates = playersFor(0)
+          if #candidates == 0 then candidates = anyPlayers end
+          substituted = true
+        end
+
+        local best, bestBusy
+        for _, pi in ipairs(candidates) do
+          local b = busyUntil[pi]
+          if b <= t + TICK - dynCost + 1e-9 and (not best or b < bestBusy) then
+            best, bestBusy = pi, b
+          end
+        end
+
+        if best then
+          busyUntil[best] = math.max(busyUntil[best], t) + dynCost
+          local inst = note.inst
+          if substituted then
+            inst = substituteFor(best)
+            stats.substituted = stats.substituted + 1
+          end
+          local a = assignments[best]
+          a[#a + 1] = { t = t, inst = inst, p = note.p }
+          stats.played = stats.played + 1
+        else
+          stats.dropped = stats.dropped + 1
+        end
       end
     end
   end
 
-  return assignments, stats
+  -- turn volleys into records; a trailing all-off volley releases every
+  -- channel once the song is over
+  for pi = 1, #players do
+    for di, list in ipairs(volleys[pi]) do
+      for _, volley in ipairs(list) do
+        local mask = 0
+        for side in pairs(volley.chans) do
+          mask = mask + 2 ^ side
+        end
+        table.insert(assignments[pi],
+          { t = volley.t, volley = true, dev = di, mask = mask })
+      end
+      if #list > 0 then
+        table.insert(assignments[pi],
+          { t = list[#list].t + volleyCost, volley = true, dev = di, mask = 0 })
+      end
+    end
+    table.sort(assignments[pi], function(a, b) return a.t < b.t end)
+  end
+
+  return assignments, stats, tunings
 end
 
 -------------------------------------------------------------- encoding ---
 
--- Wire format for a scheduled note: 5 bytes.
--- time in 10ms units (3 bytes little-endian), instrument, pitch.
-nbs.RECORD_SIZE = 5
+-- Wire format for a scheduled action: 6 bytes.
+-- time in 10ms units (3 bytes little-endian), kind, a, b.
+-- kind 0-249  = instrument id: trigger note, a = pitch
+-- kind 250    = redstone volley: a = device index (0-based), b = side mask
+nbs.RECORD_SIZE = 6
+nbs.KIND_VOLLEY = 250
 
 function nbs.encodeRecords(records)
   local out = {}
   for _, rec in ipairs(records) do
     local cs = math.floor(rec.t * 100 + 0.5)
+    local kind, a, b
+    if rec.volley then
+      kind, a, b = nbs.KIND_VOLLEY, rec.dev - 1, rec.mask
+    else
+      kind, a, b = rec.inst, rec.p, 0
+    end
     out[#out + 1] = string.char(
       cs % 256,
       math.floor(cs / 256) % 256,
       math.floor(cs / 65536) % 256,
-      rec.inst % 256,
-      rec.p % 256)
+      kind % 256,
+      a % 256,
+      b % 256)
   end
   return table.concat(out)
 end
 
 -- Reads record #i (1-based) from an encoded blob.
--- Returns time (seconds), instrument, pitch.
+-- Returns time (seconds), kind, a, b (see encodeRecords).
 function nbs.readRecord(blob, i)
   local base = (i - 1) * nbs.RECORD_SIZE
-  local a, b, c, inst, p = blob:byte(base + 1, base + 5)
-  if not p then return nil end
-  return (a + b * 256 + c * 65536) / 100, inst, p
+  local t1, t2, t3, kind, a, b = blob:byte(base + 1, base + 6)
+  if not b then return nil end
+  return (t1 + t2 * 256 + t3 * 65536) / 100, kind, a, b
+end
+
+-- Expands a volley side mask into a setOutput() table for sides 0-5.
+function nbs.maskToSides(mask)
+  local values = {}
+  for side = 0, 5 do
+    values[side] = mask % 2 == 1 and 15 or 0
+    mask = math.floor(mask / 2)
+  end
+  return values
 end
 
 ------------------------------------------------------------------- zip ---

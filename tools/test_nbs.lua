@@ -95,15 +95,20 @@ check("blockPitch: detune +100 = +1 key", nbs.blockPitch(40, 100) == 9,
 local blob = nbs.encodeRecords({
   { t = 0, inst = 0, p = 1 },
   { t = 12.34, inst = 5, p = 25 },
-  { t = 3600.5, inst = 15, p = 13 },
+  { t = 3600.5, volley = true, dev = 3, mask = 42 },
 })
-local t1, i1, p1 = nbs.readRecord(blob, 1)
-local t2, i2, p2 = nbs.readRecord(blob, 2)
-local t3, i3, p3 = nbs.readRecord(blob, 3)
-check("record 1 roundtrip", t1 == 0 and i1 == 0 and p1 == 1)
-check("record 2 roundtrip", math.abs(t2 - 12.34) < 0.011 and i2 == 5 and p2 == 25)
-check("record 3 roundtrip", math.abs(t3 - 3600.5) < 0.011 and i3 == 15 and p3 == 13)
+local t1, k1, a1r = nbs.readRecord(blob, 1)
+local t2, k2, a2r = nbs.readRecord(blob, 2)
+local t3, k3, a3r, b3 = nbs.readRecord(blob, 3)
+check("record 1 roundtrip", t1 == 0 and k1 == 0 and a1r == 1)
+check("record 2 roundtrip", math.abs(t2 - 12.34) < 0.011 and k2 == 5 and a2r == 25)
+check("volley record roundtrip", math.abs(t3 - 3600.5) < 0.011
+  and k3 == nbs.KIND_VOLLEY and a3r == 2 and b3 == 42)
 check("readRecord past end returns nil", nbs.readRecord(blob, 4) == nil)
+
+local sides = nbs.maskToSides(42) -- binary 101010: sides 1, 3, 5
+check("maskToSides", sides[0] == 0 and sides[1] == 15 and sides[2] == 0
+  and sides[3] == 15 and sides[4] == 0 and sides[5] == 15)
 
 -- scheduling -------------------------------------------------------------
 
@@ -152,6 +157,65 @@ check("substituted notes use available instruments", subInstOk)
 local _, s5 = nbs.schedule(events, drummer, { perTick = 99, fallback = false })
 check("nofallback drops instead", s5.substituted == 0 and s5.played == 0,
   s5.played)
+
+-- redstone bank scheduling -----------------------------------------------
+
+-- a bank-only player: two redstone devices, all six sides wired to piano
+-- blocks (instrument 0, the fixture's melody instrument, 264 notes)
+local organ = { {
+  inst = {},
+  banks = {
+    { inst = { [0] = 0, [1] = 0, [2] = 0, [3] = 0, [4] = 0, [5] = 0 } },
+    { inst = { [0] = 0, [1] = 0, [2] = 0, [3] = 0, [4] = 0, [5] = 0 } },
+  },
+} }
+local aB, sB, tB = nbs.schedule(events, organ, { rsDelay = 0.1 })
+check("organ plays via banks only", sB.bank > 0 and sB.bank == sB.played, sB.bank)
+check("organ tunings produced", #tB[1] == 12, #tB[1])
+local tuningOk = true
+for _, tune in ipairs(tB[1]) do
+  if tune.pitch < 1 or tune.pitch > 25 or tune.dev < 1 or tune.dev > 2
+    or tune.side < 0 or tune.side > 5 then
+    tuningOk = false
+  end
+end
+check("organ tunings valid", tuningOk)
+
+-- volley physics: per device, calls must be >= 1 tick + rsDelay apart, and
+-- a side may never be high in two consecutive volleys (no rising edge)
+local volleyOk, edgeOk = true, true
+local lastTime, lastMask = {}, {}
+for _, rec in ipairs(aB[1]) do
+  if rec.volley then
+    if lastTime[rec.dev] and rec.t - lastTime[rec.dev] < 0.15 - 0.001 then
+      volleyOk = false
+    end
+    local overlap = 0
+    local m1, m2 = lastMask[rec.dev] or 0, rec.mask
+    for _ = 1, 6 do
+      if m1 % 2 == 1 and m2 % 2 == 1 then overlap = overlap + 1 end
+      m1 = math.floor(m1 / 2)
+      m2 = math.floor(m2 / 2)
+    end
+    if overlap > 0 then edgeOk = false end
+    lastTime[rec.dev], lastMask[rec.dev] = rec.t, rec.mask
+  end
+end
+check("volleys respect device cadence", volleyOk)
+check("no side stays high across volleys", edgeOk)
+print(string.format("     organ: %d bank notes of %d total (%.1f%%)",
+  sB.bank, sB.total, 100 * sB.bank / sB.total))
+
+-- hybrid: soloist + organ should beat the plain soloist
+local hybrid = {
+  { inst = { [0] = 1, [1] = 1, [7] = 1, [8] = 1 } },
+  organ[1],
+}
+local _, sH = nbs.schedule(events, hybrid, { perTick = 1, rsDelay = 0.1 })
+check("hybrid beats solo", sH.dropped < s2.dropped,
+  sH.dropped .. " vs " .. s2.dropped)
+print(string.format("     hybrid: %d played (%d bank), %d dropped (%.1f%%)",
+  sH.played, sH.bank, sH.dropped, 100 * sH.dropped / sH.total))
 
 -- classic v0 parsing -----------------------------------------------------
 

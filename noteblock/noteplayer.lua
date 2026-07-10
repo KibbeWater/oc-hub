@@ -1,22 +1,25 @@
 -- noteplayer: note block player node for the noteblock music system.
 -- Runs on a computer with vanilla note blocks attached through Adapters
 -- and a (wireless) network card. The master ("noteblock") does all song
--- parsing and scheduling; this node just plays (instrument, pitch) at the
--- exact times it is told to, so many nodes together can play dense songs
--- that a single computer never could (each trigger costs ~1 game tick).
+-- parsing and scheduling; this node just executes its schedule precisely.
+--
+-- Two kinds of hardware, because of how OpenComputers costs calls:
+--  * adapter note blocks - trigger(pitch) is a synchronized call (~1 game
+--    tick each): flexible pitch, ~20 notes/s per computer.
+--  * redstone banks - note blocks fed by the sides of a Redstone I/O
+--    block (or this computer's redstone card). One setOutput call fires
+--    up to 6 pre-tuned blocks at exactly the same instant. The master
+--    re-tunes them per song through the adapter.
 --
 -- Usage:
 --   noteplayer                daemon: wait for a master (Ctrl+C stops)
---   noteplayer calibrate      assign an instrument to every note block
+--   noteplayer calibrate      assign instruments + map redstone banks
 --   noteplayer test           play a quick scale on every block
 --   noteplayer status         show the current calibration
 -- Options: --port=3001
 --
--- Calibration is stored in /etc/noteplayer.cfg. Instruments follow NBS ids
--- (the block placed UNDER the note block decides the sound):
--- 0 Piano, 1 Double Bass, 2 Bass Drum, 3 Snare, 4 Click, 5 Guitar,
--- 6 Flute, 7 Bell, 8 Chime, 9 Xylophone, 10 Iron Xylophone, 11 Cow Bell,
--- 12 Didgeridoo, 13 Bit, 14 Banjo, 15 Pling.
+-- Calibration lives in /etc/noteplayer.cfg. A calibration.dat from the
+-- old NoteblockPlayer is migrated automatically on first run.
 
 local component = require("component")
 local computer = require("computer")
@@ -24,7 +27,6 @@ local event = require("event")
 local nbs = require("nbs")
 local serialization = require("serialization")
 local shell = require("shell")
-local term = require("term")
 
 local CONFIG = "/etc/noteplayer.cfg"
 local PROTOCOL = "NBP2"
@@ -40,50 +42,124 @@ local function fail(msg)
 end
 
 ------------------------------------------------------------ calibration --
+-- Config schema: { blocks = {address -> instrument},
+--                  banks  = { {addr = <redstone address>,
+--                              sides = {[side 0-5] = noteBlockAddress}}, } }
 
-local function loadCalibration()
+-- The old NoteblockPlayer stored {instrument -> address} in calibration.dat.
+local function migrateLegacy()
+  for _, oldPath in ipairs({ "/home/calibration.dat",
+    shell.resolve("calibration.dat") }) do
+    local f = io.open(oldPath, "r")
+    if f then
+      local legacy = serialization.unserialize(f:read("*a") or "") or {}
+      f:close()
+      local blocks, found = {}, 0
+      for inst, address in pairs(legacy) do
+        if type(inst) == "number" and type(address) == "string"
+          and component.type(address) == "note_block" then
+          blocks[address] = inst
+          found = found + 1
+        end
+      end
+      if found > 0 then
+        printf("migrated %d block(s) from legacy %s", found, oldPath)
+        return { blocks = blocks, banks = {} }
+      end
+    end
+  end
+  return nil
+end
+
+local function loadConfig()
   local f = io.open(CONFIG, "r")
-  if not f then return {} end
+  if not f then
+    local migrated = migrateLegacy()
+    if migrated then
+      local out = io.open(CONFIG, "w")
+      if out then
+        out:write(serialization.serialize(migrated))
+        out:close()
+        printf("saved migrated calibration to %s", CONFIG)
+      end
+      return migrated
+    end
+    return { blocks = {}, banks = {} }
+  end
   local data = serialization.unserialize(f:read("*a") or "") or {}
   f:close()
-  -- keep only blocks that are still connected
-  local mapping = {}
-  for address, inst in pairs(data) do
+  if not data.blocks then
+    -- v1 schema was a flat {address -> instrument} map
+    data = { blocks = data, banks = {} }
+  end
+  data.banks = data.banks or {}
+  -- drop anything that is no longer connected
+  local blocks = {}
+  for address, inst in pairs(data.blocks) do
     if component.type(address) == "note_block" then
-      mapping[address] = inst
+      blocks[address] = inst
     end
   end
-  return mapping
+  data.blocks = blocks
+  local banks = {}
+  for _, bank in ipairs(data.banks) do
+    if component.type(bank.addr) == "redstone" then
+      banks[#banks + 1] = bank
+    end
+  end
+  data.banks = banks
+  return data
 end
 
-local function saveCalibration(mapping)
+local function saveConfig(config)
   local f, err = io.open(CONFIG, "w")
   if not f then fail("cannot save calibration: " .. tostring(err)) end
-  f:write(serialization.serialize(mapping))
+  f:write(serialization.serialize(config))
   f:close()
 end
 
--- Builds blocks[instrument] = {proxy, ...} from the calibration.
-local function buildBlocks(mapping)
-  local blocks, counts = {}, {}
-  for address, inst in pairs(mapping) do
-    local proxy = component.proxy(address)
-    if proxy then
-      blocks[inst] = blocks[inst] or {}
-      table.insert(blocks[inst], proxy)
-      counts[inst] = (counts[inst] or 0) + 1
+-- Splits calibrated blocks into dynamic (adapter-triggered) and bank
+-- (redstone-fed, pitch managed per song) blocks.
+local function buildSetup(config)
+  local bankBlocks = {}
+  for _, bank in ipairs(config.banks) do
+    for _, address in pairs(bank.sides) do
+      bankBlocks[address] = true
     end
   end
-  return blocks, counts
+  local blocks, counts = {}, {}
+  for address, inst in pairs(config.blocks) do
+    if not bankBlocks[address] then
+      local proxy = component.proxy(address)
+      if proxy then
+        blocks[inst] = blocks[inst] or {}
+        table.insert(blocks[inst], proxy)
+        counts[inst] = (counts[inst] or 0) + 1
+      end
+    end
+  end
+  local banks = {}
+  for _, bank in ipairs(config.banks) do
+    local proxy = component.proxy(bank.addr)
+    if proxy then
+      banks[#banks + 1] = { rs = proxy, sides = bank.sides }
+    end
+  end
+  return blocks, counts, banks
 end
 
 local function commandCalibrate()
-  local mapping = {}
-  local total, index = 0, 0
-  for _ in component.list("note_block") do total = total + 1 end
-  if total == 0 then fail("no note blocks found; attach them via Adapters") end
+  local config = { blocks = {}, banks = {} }
+  local ordered = {}
+  for address in component.list("note_block") do
+    ordered[#ordered + 1] = address
+  end
+  table.sort(ordered)
+  if #ordered == 0 then
+    fail("no note blocks found; attach them via Adapters")
+  end
 
-  print("Calibrating " .. total .. " note block(s).")
+  print("Calibrating " .. #ordered .. " note block(s).")
   print("Each block plays 3 notes; enter its instrument number.")
   print("")
   for i = 0, 15 do
@@ -91,11 +167,10 @@ local function commandCalibrate()
   end
   print("")
 
-  for address in component.list("note_block") do
-    index = index + 1
+  for index, address in ipairs(ordered) do
     local block = component.proxy(address)
     while true do
-      io.write(string.format("[%d/%d] listen... ", index, total))
+      io.write(string.format("[block %d/%d] listen... ", index, #ordered))
       for _ = 1, 3 do
         pcall(block.trigger, 13)
         os.sleep(0.4)
@@ -110,8 +185,8 @@ local function commandCalibrate()
       else
         local inst = tonumber(input)
         if inst and inst >= 0 and inst <= 15 then
-          mapping[address] = inst
-          printf("  -> %s", nbs.INSTRUMENTS[inst])
+          config.blocks[address] = inst
+          printf("  block %d -> %s", index, nbs.INSTRUMENTS[inst])
           break
         end
         print("  enter a number 0-15, r or s")
@@ -119,39 +194,105 @@ local function commandCalibrate()
     end
   end
 
-  saveCalibration(mapping)
-  local _, counts = buildBlocks(mapping)
+  -- redstone banks: which calibrated block hangs on which redstone side
+  local devices = {}
+  for address in component.list("redstone") do
+    devices[#devices + 1] = address
+  end
+  table.sort(devices)
+  if #devices > 0 then
+    print("")
+    printf("%d redstone device(s) found (I/O blocks or redstone card).", #devices)
+    print("Note blocks fed by their sides become fast pre-tuned 'banks':")
+    print("one call fires up to 6 of them at exactly the same time.")
+    io.write("Map redstone banks? (y/N): ")
+    local answer = (io.read() or ""):lower()
+    if answer:sub(1, 1) == "y" then
+      for di, address in ipairs(devices) do
+        local rs = component.proxy(address)
+        local sides = {}
+        printf("device %d/%d (%s):", di, #devices, address:sub(1, 8))
+        for side = 0, 5 do
+          io.write(string.format("  side %d: pulsing... ", side))
+          pcall(rs.setOutput, side, 15)
+          os.sleep(0.3)
+          pcall(rs.setOutput, side, 0)
+          os.sleep(0.2)
+          io.write("which block # rang? (Enter = none): ")
+          local input = tonumber((io.read() or ""):gsub("%s", ""))
+          if input and ordered[input] and config.blocks[ordered[input]] then
+            sides[side] = ordered[input]
+            printf("    side %d -> block %d (%s)", side, input,
+              nbs.INSTRUMENTS[config.blocks[ordered[input]]])
+          end
+        end
+        if next(sides) then
+          config.banks[#config.banks + 1] = { addr = address, sides = sides }
+        end
+      end
+    end
+  end
+
+  saveConfig(config)
   print("")
   print("Saved to " .. CONFIG .. ":")
+  local _, counts, banks = buildSetup(config)
   for inst, count in pairs(counts) do
-    printf("  %-14s x%d", nbs.INSTRUMENTS[inst] or ("#" .. inst), count)
+    printf("  dynamic %-14s x%d", nbs.INSTRUMENTS[inst] or ("#" .. inst), count)
+  end
+  for i, bank in ipairs(banks) do
+    local n = 0
+    for _ in pairs(bank.sides) do n = n + 1 end
+    printf("  bank %d: %d channel(s)", i, n)
   end
 end
 
 local function commandStatus()
-  local mapping = loadCalibration()
-  local _, counts = buildBlocks(mapping)
-  if not next(counts) then
+  local config = loadConfig()
+  local _, counts, banks = buildSetup(config)
+  if not next(counts) and #banks == 0 then
     print("Not calibrated. Run: noteplayer calibrate")
     return
   end
-  print("Calibrated note blocks:")
+  print("Dynamic note blocks (adapter trigger):")
   for inst, count in pairs(counts) do
     printf("  %2d %-14s x%d", inst, nbs.INSTRUMENTS[inst] or "?", count)
+  end
+  for i, bank in ipairs(banks) do
+    printf("Redstone bank %d (%s):", i, bank.rs.address:sub(1, 8))
+    for side = 0, 5 do
+      local address = bank.sides[side]
+      if address then
+        local inst = config.blocks[address]
+        printf("  side %d: %s", side, nbs.INSTRUMENTS[inst] or "?")
+      end
+    end
   end
 end
 
 local function commandTest()
-  local blocks = buildBlocks(loadCalibration())
-  if not next(blocks) then fail("not calibrated; run: noteplayer calibrate") end
+  local config = loadConfig()
+  local blocks, _, banks = buildSetup(config)
+  if not next(blocks) and #banks == 0 then
+    fail("not calibrated; run: noteplayer calibrate")
+  end
   for inst, list in pairs(blocks) do
-    printf("testing %s (x%d)", nbs.INSTRUMENTS[inst] or ("#" .. inst), #list)
+    printf("dynamic %s (x%d)", nbs.INSTRUMENTS[inst] or ("#" .. inst), #list)
     for _, block in ipairs(list) do
       for pitch = 1, 25, 6 do
         pcall(block.trigger, pitch)
         os.sleep(0.15)
       end
     end
+  end
+  for i, bank in ipairs(banks) do
+    printf("bank %d volley", i)
+    local mask = 0
+    for side in pairs(bank.sides) do mask = mask + 2 ^ side end
+    pcall(bank.rs.setOutput, nbs.maskToSides(mask))
+    os.sleep(0.4)
+    pcall(bank.rs.setOutput, nbs.maskToSides(0))
+    os.sleep(0.4)
   end
 end
 
@@ -162,48 +303,59 @@ local function commandDaemon()
     fail("a network card is required")
   end
   local modem = component.modem
-  local mapping = loadCalibration()
-  local blocks, counts = buildBlocks(mapping)
-  if not next(blocks) then
+  local config = loadConfig()
+  local blocks, counts, banks = buildSetup(config)
+  if not next(blocks) and #banks == 0 then
     fail("not calibrated; run: noteplayer calibrate")
   end
 
   modem.open(port)
   if modem.isWireless() then pcall(modem.setStrength, 400) end
 
+  -- hello payload: "inst:count,..." then "|" then per-device bank sides
   local instCSV = {}
   for inst, count in pairs(counts) do
     instCSV[#instCSV + 1] = inst .. ":" .. count
   end
-  instCSV = table.concat(instCSV, ",")
+  local bankParts = {}
+  for _, bank in ipairs(banks) do
+    local sides = {}
+    for side = 0, 5 do
+      local address = bank.sides[side]
+      sides[side + 1] = address and tostring(config.blocks[address]) or "-"
+    end
+    bankParts[#bankParts + 1] = table.concat(sides, ",")
+  end
+  local helloPayload = table.concat(instCSV, ",")
+    .. "|" .. table.concat(bankParts, ";")
 
   printf("noteplayer: listening on port %d (Ctrl+C to stop)", port)
   for inst, count in pairs(counts) do
-    printf("  %-14s x%d", nbs.INSTRUMENTS[inst] or ("#" .. inst), count)
+    printf("  dynamic %-14s x%d", nbs.INSTRUMENTS[inst] or ("#" .. inst), count)
   end
+  if #banks > 0 then printf("  %d redstone bank(s)", #banks) end
 
   -- state
   local master
   local songId, songName
-  local chunks, lastSeq
-  local blob
+  local chunks, blob
   local recordCount, nextIndex = 0, 1
   local state = "idle" -- idle | loaded | playing | paused
-  local startTime = 0
-  local pausedAt = 0
+  local startTime, pausedAt = 0, 0
   local ring = {}
 
   local function reset()
-    songId, songName, chunks, lastSeq, blob = nil, nil, nil, nil, nil
+    songId, songName, chunks, blob = nil, nil, nil, nil
     recordCount, nextIndex = 0, 1
     state = "idle"
+    for _, bank in ipairs(banks) do
+      pcall(bank.rs.setOutput, nbs.maskToSides(0))
+    end
   end
 
   local function trigger(inst, pitch)
     local list = blocks[inst]
     if not list then
-      -- shouldn't happen (the master only assigns what we reported), but
-      -- play on any block rather than staying silent
       local _, fallbackList = next(blocks)
       list = fallbackList
     end
@@ -212,9 +364,34 @@ local function commandDaemon()
     pcall(list[ring[inst]].trigger, pitch)
   end
 
-  local function handleMessage(from, kind, a, b, c, d)
+  local function execute(kind, a, b)
+    if kind == nbs.KIND_VOLLEY then
+      local bank = banks[a + 1]
+      if bank then pcall(bank.rs.setOutput, nbs.maskToSides(b)) end
+    else
+      trigger(kind, a)
+    end
+  end
+
+  -- per-song tuning: "dev:side:pitch,..." (setPitch is ~1 tick per block)
+  local function applyTuning(csv)
+    local applied = 0
+    for dev, side, pitch in tostring(csv):gmatch("(%d+):(%d+):(%d+)") do
+      local bank = banks[tonumber(dev)]
+      local address = bank and bank.sides[tonumber(side)]
+      if address then
+        local proxy = component.proxy(address)
+        if proxy and pcall(proxy.setPitch, tonumber(pitch)) then
+          applied = applied + 1
+        end
+      end
+    end
+    return applied
+  end
+
+  local function handleMessage(from, kind, a, b, c)
     if kind == "discover" then
-      modem.send(from, port, PROTOCOL, "hello", instCSV)
+      modem.send(from, port, PROTOCOL, "hello", helloPayload)
     elseif kind == "song" then
       reset()
       master = from
@@ -224,7 +401,7 @@ local function commandDaemon()
     elseif kind == "notes" and from == master and a == songId then
       chunks[tonumber(b) or 0] = c
     elseif kind == "eof" and from == master and a == songId then
-      lastSeq = tonumber(b) or 0
+      local lastSeq = tonumber(b) or 0
       local missing = {}
       for seq = 1, lastSeq do
         if not chunks[seq] then missing[#missing + 1] = seq end
@@ -235,9 +412,13 @@ local function commandDaemon()
         recordCount = math.floor(#blob / nbs.RECORD_SIZE)
         nextIndex = 1
         state = "loaded"
-        printf("song ready: %d notes for this node", recordCount)
+        printf("song ready: %d action(s) for this node", recordCount)
       end
       modem.send(from, port, PROTOCOL, "ready", songId, table.concat(missing, ","))
+    elseif kind == "tune" and from == master and a == songId then
+      local applied = applyTuning(b)
+      if applied > 0 then printf("tuned %d bank block(s)", applied) end
+      modem.send(from, port, PROTOCOL, "tuned", songId)
     elseif kind == "play" and from == master and a == songId and blob then
       startTime = computer.uptime() + (tonumber(b) or 1)
       nextIndex = 1
@@ -274,14 +455,14 @@ local function commandDaemon()
 
       local sig = table.pack(event.pull(timeout))
       if sig[1] == "modem_message" and sig[4] == port and sig[6] == PROTOCOL then
-        handleMessage(sig[3], sig[7], sig[8], sig[9], sig[10], sig[11])
+        handleMessage(sig[3], sig[7], sig[8], sig[9], sig[10])
       end
 
-      -- fire every note that is due
+      -- fire every action that is due
       while state == "playing" do
-        local t, inst, pitch = nbs.readRecord(blob, nextIndex)
+        local t, kind, a, b = nbs.readRecord(blob, nextIndex)
         if not t or startTime + t > computer.uptime() then break end
-        trigger(inst, pitch)
+        execute(kind, a, b)
         nextIndex = nextIndex + 1
       end
     end
