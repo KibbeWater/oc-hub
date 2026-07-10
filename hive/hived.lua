@@ -170,6 +170,8 @@ local function cmdRun()
       svc.log.info("device %d left the signaled area", id)
     elseif e.subcode == hxnet.EVT.UNAUTH then
       svc.log.alert("device %d attempted an unauthorized action", id)
+    elseif e.subcode == hxnet.EVT.NAV_FAIL then
+      svc.log.warn("device %d error: %s", id, tostring(e.detail))
     end
   end)
 

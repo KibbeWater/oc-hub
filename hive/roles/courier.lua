@@ -43,6 +43,6 @@ return {
   onIdle = function(api) api.sleep(1) end,
   onLowEnergy = function(api)
     local h = api.home() or api.queen()
-    if h then api.goTo(h.x, (h.y or 64) + 2, h.z, { cruise = (h.y or 64) + 20 }) end
+    if h then api.goTo(h.x, (h.y or 64) + 1, h.z, { cruise = (h.y or 64) + 20 }) end
   end,
 }

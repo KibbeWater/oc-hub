@@ -55,6 +55,7 @@ return {
 
   onLowEnergy = function(api)
     local home = api.home() or api.queen()
-    if home then api.goTo(home.x, home.y + 2, home.z, { cruise = (home.y or 64) + 20 }) end
+    -- descend to home+1: one block above the charger, inside its 3x3x3 charge field
+    if home then api.goTo(home.x, home.y + 1, home.z, { cruise = (home.y or 64) + 20 }) end
   end,
 }

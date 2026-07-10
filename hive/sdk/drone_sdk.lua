@@ -310,9 +310,11 @@ function sdk.main(role, ctx)
   while not state.reboot do
     guard = guard + 1
     if ctx.maxSteps and guard > ctx.maxSteps then break end -- sim safety
-    pumpOnce(0.25)
-    heartbeat()
-    if ctx.findWaypoints and (ctx.now() - state.lastCal) >= 120 then calibrate() end
+    -- report a handler crash instead of letting it unwind into a reboot
+    local pok, perr = pcall(pumpOnce, 0.25)
+    if not pok then sendEvt(hxnet.EVT.NAV_FAIL, tostring(perr):sub(1, 100)) end
+    pcall(heartbeat)
+    if ctx.findWaypoints and (ctx.now() - state.lastCal) >= 120 then pcall(calibrate) end
     local e = ctx.energy() or 1
     if node.coverage:best() then state.everCov = true end -- latch: had coverage at least once
 
@@ -352,7 +354,7 @@ function sdk.main(role, ctx)
       state.runState = hxnet.STATE.LOWPWR
       if role.onLowEnergy then pcall(role.onLowEnergy, api) else
         local h = ctx.home
-        if h then pcall(api.goTo, h.x, (h.y or 64) + 2, h.z) end
+        if h then pcall(api.goTo, h.x, (h.y or 64) + 1, h.z) end -- +1 = inside the charge field
       end
       api.sleep(1)
     elseif role.onIdle then
