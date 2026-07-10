@@ -225,6 +225,7 @@ function sdk.main(role, ctx)
   -- if the column is outside the authorized operating area.
   function api.scanColumn()
     local px, py, pz = pos()
+    if not px then return nil end -- lost the fix this instant; skip the column
     if state.grant and not api.canOperate(px, pz) then
       sendEvt(hxnet.EVT.UNAUTH, string.pack("<i2i2", px, pz))
       return nil
@@ -302,7 +303,7 @@ function sdk.main(role, ctx)
   end
   state.runState = hxnet.STATE.IDLE
   calibrate() -- establish the universal-frame offset from visible waypoints
-  if role.onInit then role.onInit(api) end
+  if role.onInit then pcall(role.onInit, api) end
 
   local LOW, CRIT = 0.40, 0.10
   local guard = 0
@@ -328,31 +329,34 @@ function sdk.main(role, ctx)
     elseif state.task and e >= LOW then
       state.aborted = false
       state.runState = hxnet.STATE.WORKING
-      local ok, detail = role.onTask(api, state.task)
+      -- pcall the role so a bug fails the task (with the error reported) instead
+      -- of propagating out and rebooting the whole drone.
+      local safe, r, detail = pcall(role.onTask, api, state.task)
       state.task = nil
       state.runState = hxnet.STATE.IDLE
       -- if we drifted out of coverage while working, fly back so the report lands
       if state.everCov and api.coverageLost(15) then
         local a = api.coverageAnchor() or ctx.home
-        if a then api.goTo(a.x, (a.y or 64) + 4, a.z) end
+        if a then pcall(api.goTo, a.x, (a.y or 64) + 4, a.z) end
       end
-      if ok == "done" or ok == true then sendEvt(hxnet.EVT.DONE)
+      if not safe then sendEvt(hxnet.EVT.FAILED, tostring(r))
+      elseif r == "done" or r == true then sendEvt(hxnet.EVT.DONE)
       else sendEvt(hxnet.EVT.FAILED, tostring(detail or "")) end
       if state.recall then
         state.recall = false; state.aborted = false
-        if role.onLowEnergy then role.onLowEnergy(api) end
+        if role.onLowEnergy then pcall(role.onLowEnergy, api) end
       end
     elseif e < LOW then
       -- low battery: drop any task and recharge (role default: dock/home)
       state.task = nil
       state.runState = hxnet.STATE.LOWPWR
-      if role.onLowEnergy then role.onLowEnergy(api) else
+      if role.onLowEnergy then pcall(role.onLowEnergy, api) else
         local h = ctx.home
-        if h then api.goTo(h.x, (h.y or 64) + 2, h.z) end
+        if h then pcall(api.goTo, h.x, (h.y or 64) + 2, h.z) end
       end
       api.sleep(1)
     elseif role.onIdle then
-      role.onIdle(api)
+      pcall(role.onIdle, api)
     else
       api.sleep(0.5)
     end

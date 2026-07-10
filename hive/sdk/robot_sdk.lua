@@ -208,7 +208,7 @@ function sdk.main(role, ctx)
   end
   state.runState = hxnet.STATE.IDLE
   calibrate()
-  if role.onInit then role.onInit(api) end
+  if role.onInit then pcall(role.onInit, api) end
 
   local LOW = 0.30
   local guard = 0
@@ -225,16 +225,18 @@ function sdk.main(role, ctx)
     elseif state.task and e >= LOW then
       state.aborted = false
       state.runState = hxnet.STATE.WORKING
-      local ok, detail = role.onTask(api, state.task)
+      -- pcall the role so a bug fails the task instead of rebooting the robot.
+      local safe, r, detail = pcall(role.onTask, api, state.task)
       state.task = nil
       state.runState = hxnet.STATE.IDLE
-      if ok == "done" or ok == true then sendEvt(hxnet.EVT.DONE)
+      if not safe then sendEvt(hxnet.EVT.FAILED, tostring(r))
+      elseif r == "done" or r == true then sendEvt(hxnet.EVT.DONE)
       else sendEvt(hxnet.EVT.FAILED, tostring(detail or "")) end
     elseif e < LOW then
       state.task = nil
-      if role.onLowEnergy then role.onLowEnergy(api) else api.dock() end
+      if role.onLowEnergy then pcall(role.onLowEnergy, api) else pcall(api.dock) end
     elseif role.onIdle then
-      role.onIdle(api)
+      pcall(role.onIdle, api)
     else
       api.sleep(0.5)
     end
