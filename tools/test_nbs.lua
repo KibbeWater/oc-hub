@@ -54,6 +54,45 @@ if zipPath then
     extracted and #extracted .. " vs " .. #fileData)
 end
 
+-- deflated zip entries ----------------------------------------------------
+
+local function z16(v)
+  return string.char(v % 256, math.floor(v / 256) % 256)
+end
+local function z32(v)
+  return string.char(v % 256, math.floor(v / 256) % 256,
+    math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+end
+local rawDeflate = "\1\2\3fake-deflate-bytes\4\5"
+local plain = "HELLO NOTE BLOCKS"
+local entryName = "song.nbs"
+local localHeader = "PK\3\4" .. z16(20) .. z16(0) .. z16(8) .. z16(0) .. z16(0)
+  .. z32(0) .. z32(#rawDeflate) .. z32(#plain)
+  .. z16(#entryName) .. z16(0) .. entryName
+local central = "PK\1\2" .. z16(20) .. z16(20) .. z16(0) .. z16(8)
+  .. z16(0) .. z16(0) .. z32(0) .. z32(#rawDeflate) .. z32(#plain)
+  .. z16(#entryName) .. z16(0) .. z16(0) .. z16(0) .. z16(0)
+  .. z32(0) .. z32(0) .. entryName
+local zipD = localHeader .. rawDeflate .. central
+  .. "PK\5\6" .. z16(0) .. z16(0) .. z16(1) .. z16(1)
+  .. z32(#central) .. z32(#localHeader + #rawDeflate) .. z16(0)
+
+local noCard, cardErr = nbs.unzip(zipD, "%.nbs$", nil)
+check("deflated entry without inflater errors", noCard == nil
+  and tostring(cardErr):match("Data Card") ~= nil, cardErr)
+
+local gotRaw
+local okOut, okName = nbs.unzip(zipD, "%.nbs$", function(raw)
+  gotRaw = raw
+  return plain
+end)
+check("deflated entry inflates", okOut == plain and okName == entryName, okName)
+check("inflater receives raw deflate bytes", gotRaw == rawDeflate)
+
+local badOut, badErr = nbs.unzip(zipD, "%.nbs$", function() return "short" end)
+check("decompressed size mismatch detected", badOut == nil
+  and tostring(badErr):match("mismatch") ~= nil, badErr)
+
 -- parsing ----------------------------------------------------------------
 
 local song, perr = nbs.parse(fileData)

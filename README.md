@@ -409,6 +409,9 @@ fine for deployment targets, but keep your master checkout unoptimized.
 - **ngrok returns an HTML page instead of files** — shouldn't happen (the
   tools send `ngrok-skip-browser-warning`), but if you test in a browser
   that page is expected on the free tier.
+- **"zip entry 'song.nbs' is compressed"** — some noteblock.world packed
+  songs are deflated rather than stored. Put a **Data Card** (any tier) in
+  the master computer; `noteblock` uses its native inflate automatically.
 - **Installer EEPROM shows an error and halts** — the message stays on
   screen; most causes are no internet card, no hard drive, or a typo in the
   flashed repo config (re-run `mkinstaller`).

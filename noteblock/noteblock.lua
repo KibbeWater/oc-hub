@@ -142,7 +142,22 @@ local function sanitizeName(name)
   return name
 end
 
--- Downloads a song by public id. Returns path, meta.
+-- Some packed songs on noteblock.world have a deflated (not stored)
+-- song.nbs. The Data Card's inflate expects a zlib stream; zip entries
+-- are raw deflate, so prepend the zlib header. The missing adler32
+-- trailer is tolerated by Java's InflaterOutputStream.
+local function zipInflater()
+  if not component.isAvailable("data") then return nil end
+  local dataCard = component.data
+  if not dataCard.inflate then return nil end
+  return function(raw)
+    local ok, out = pcall(dataCard.inflate, "\120\156" .. raw)
+    if ok then return out end
+    return nil, out
+  end
+end
+
+-- Downloads a song by public id. Returns path, meta or nil, error.
 local function downloadSong(id)
   ensureInternet()
   local meta = apiJson(API .. "/song/" .. id) or {}
@@ -150,21 +165,21 @@ local function downloadSong(id)
   local url, err = fetch(API .. "/song/" .. id .. "/open",
     { ["User-Agent"] = UA["User-Agent"], src = "downloadButton" })
   if not url then
-    print("")
-    fail("cannot get song from noteblock.world: " .. tostring(err))
+    print("failed")
+    return nil, "cannot get song from noteblock.world: " .. tostring(err)
   end
   url = url:gsub("^%s*\"?", ""):gsub("\"?%s*$", "")
   print("ok")
   io.write("downloading song... ")
   local zip, zerr = fetch(url)
   if not zip then
-    print("")
-    fail("download failed: " .. tostring(zerr))
+    print("failed")
+    return nil, "download failed: " .. tostring(zerr)
   end
-  local data, uerr = nbs.unzipStored(zip, "%.nbs$")
+  local data, uerr = nbs.unzip(zip, "%.nbs$", zipInflater())
   if not data then
-    print("")
-    fail(tostring(uerr))
+    print("failed")
+    return nil, tostring(uerr)
   end
   printf("ok (%d bytes)", #data)
 
@@ -173,7 +188,7 @@ local function downloadSong(id)
   if base == "" then base = id end
   local path = fs.concat(MUSIC_DIR, base .. "." .. id .. ".nbs")
   local f, ferr = io.open(path, "wb")
-  if not f then fail("cannot save song: " .. tostring(ferr)) end
+  if not f then return nil, "cannot save song: " .. tostring(ferr) end
   f:write(data)
   f:close()
   return path, meta
@@ -189,7 +204,11 @@ local function resolveTarget(target)
     and not fs.exists(path) then
     id = target
   end
-  if id then return (downloadSong(id)) end
+  if id then
+    local path2, derr = downloadSong(id)
+    if not path2 then fail(derr) end
+    return path2
+  end
   if target:match("^https?://") then
     ensureInternet()
     io.write("downloading " .. target .. " ... ")
@@ -200,7 +219,9 @@ local function resolveTarget(target)
     end
     print("ok")
     if data:sub(1, 2) == "PK" then
-      data = assert(nbs.unzipStored(data, "%.nbs$"))
+      local unzipped, uerr = nbs.unzip(data, "%.nbs$", zipInflater())
+      if not unzipped then fail(uerr) end
+      data = unzipped
     end
     fs.makeDirectory(MUSIC_DIR)
     local dest = fs.concat(MUSIC_DIR, "download.nbs")
@@ -651,8 +672,12 @@ local function browse()
       local pick = items[tonumber(input) or -1]
       if pick and pick.publicId then
         term.clear()
-        local path = downloadSong(pick.publicId)
-        playFile(path)
+        local path, derr = downloadSong(pick.publicId)
+        if path then
+          playFile(path)
+        else
+          printf("error: %s", tostring(derr))
+        end
         io.write("press Enter to go back... ")
         io.read()
       end

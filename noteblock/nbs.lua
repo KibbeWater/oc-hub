@@ -696,10 +696,13 @@ end
 
 ------------------------------------------------------------------- zip ---
 
--- Extracts the first file matching `pattern` from a ZIP archive that
--- stores entries uncompressed (as noteblock.world packed songs do).
+-- Extracts the first file matching `pattern` from a ZIP archive.
+-- Stored (uncompressed) entries extract directly; deflated entries need
+-- `inflate`, a function(rawDeflate) -> data | nil, err (in OpenOS, wrap
+-- the Data Card: its inflate expects a zlib stream, so callers prepend
+-- the \x78\x9C header - see zipInflater in noteblock.lua).
 -- Returns contents, entryName or nil, error.
-function nbs.unzipStored(zipData, pattern)
+function nbs.unzip(zipData, pattern, inflate)
   local function u16(pos)
     local a, b = zipData:byte(pos, pos + 1)
     return (a or 0) + (b or 0) * 256
@@ -733,19 +736,40 @@ function nbs.unzipStored(zipData, pattern)
     local localOffset = u32(pos + 42)
     local name = zipData:sub(pos + 46, pos + 45 + nameLen)
     if name:match(pattern) then
-      if method ~= 0 then
-        return nil, "zip entry '" .. name .. "' is compressed"
-      end
+      local uncompSize = u32(pos + 24)
       local lp = localOffset + 1
       if zipData:sub(lp, lp + 3) ~= "PK\3\4" then
         return nil, "corrupt zip local header"
       end
       local dataStart = lp + 30 + u16(lp + 26) + u16(lp + 28)
-      return zipData:sub(dataStart, dataStart + compSize - 1), name
+      local raw = zipData:sub(dataStart, dataStart + compSize - 1)
+      if method == 0 then
+        return raw, name
+      elseif method == 8 then
+        if not inflate then
+          return nil, "zip entry '" .. name .. "' is compressed; install"
+            .. " a Data Card (any tier) in this computer to decompress it"
+        end
+        local out, err = inflate(raw)
+        if not out then
+          return nil, "decompression failed: " .. tostring(err)
+        end
+        if uncompSize > 0 and #out ~= uncompSize then
+          return nil, string.format(
+            "decompressed size mismatch (%d vs %d expected)", #out, uncompSize)
+        end
+        return out, name
+      end
+      return nil, "zip entry '" .. name .. "' uses unsupported method " .. method
     end
     pos = pos + 46 + nameLen + extraLen + commentLen
   end
   return nil, "no entry matching '" .. pattern .. "' in archive"
+end
+
+-- Backwards-compatible alias (stored entries only).
+function nbs.unzipStored(zipData, pattern)
+  return nbs.unzip(zipData, pattern, nil)
 end
 
 return nbs
