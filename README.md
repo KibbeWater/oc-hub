@@ -21,6 +21,7 @@ EEPROM auto-installer and by `ocgit install`.
 ## Repository layout
 
 ```
+setup.lua              interactive setup wizard (run once per computer)
 oc-manifest.cfg        install manifest (what goes where in-game)
 ocgit/ocgit.lua        pull-only git client (GitHub API)
 ocgit/ocdev.lua        live-sync watcher
@@ -37,9 +38,25 @@ examples/blink.lua     example worker script for ocnet nodes
 tools/serve.py         dev server for live sync
 ```
 
-## Bootstrap a "master" computer in-game
+## Setup: one command in-game
 
 On an OpenOS computer with an internet card:
+
+```
+wget -f https://raw.githubusercontent.com/KibbeWater/oc-hub/main/setup.lua /tmp/setup.lua
+/tmp/setup.lua
+```
+
+The setup wizard (windowed if a GPU + screen are present, plain text prompts
+otherwise) lets you configure the repo/branch, checkout directory, token and
+optimization, toggle the steps to run, then bootstraps `ocgit`, clones the
+repository, applies `oc-manifest.cfg` — putting the whole toolkit on the
+PATH — and can launch `mkinstaller` at the end to flash an EEPROM. Re-running
+it later is safe: it pulls instead of cloning and overwrites the tools with
+the current versions.
+
+<details>
+<summary>Manual bootstrap (what setup.lua automates)</summary>
 
 ```
 mkdir /usr/lib
@@ -47,13 +64,12 @@ mkdir /usr/bin
 wget https://raw.githubusercontent.com/KibbeWater/oc-hub/main/ocgit/json.lua /usr/lib/json.lua
 wget https://raw.githubusercontent.com/KibbeWater/oc-hub/main/ocgit/ocgit.lua /usr/bin/ocgit.lua
 ocgit clone KibbeWater/oc-hub /home/work
-cd /home/work
-ocgit install
+ocgit install /home/work
 ```
+</details>
 
-`ocgit install` reads `oc-manifest.cfg` and copies everything to its declared
-target, so after this the whole toolkit is on the PATH. Every other computer
-can be set up automatically with an installer EEPROM (below).
+Every other computer can be set up automatically with an installer EEPROM
+(below) — or by running `setup.lua` on it, too.
 
 ## ocgit — git-based deployment
 
