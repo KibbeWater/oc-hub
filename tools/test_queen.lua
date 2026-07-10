@@ -184,7 +184,7 @@ do
 
   -- firmware image the queen serves
   local image = ("firmware-bytes-"):rep(700) .. "END" -- multi-chunk
-  local imgSha = fakeSha(image)
+  local imgSha = hxnet.imageDigest(image, fakeSha)
 
   local qn = netshim.new{ id = 0, master = master, hmac = fakeHmac, now = now,
     send = busSend("q"), epoch = 3, chunkSize = 4096,
@@ -255,7 +255,7 @@ do
   pump()
   check("transfer complete after NAK repair", devState.rx:complete())
   check("assembled image matches", devState.rx:image() == image)
-  check("image sha matches META", fakeSha(devState.rx:image()) == devState.meta.sha)
+  check("image digest matches META", hxnet.imageDigest(devState.rx:image(), fakeSha) == devState.meta.sha)
 end
 
 print(string.rep("-", 40))

@@ -179,6 +179,17 @@ do
   local _, _, cp = string.unpack("<I2I2", chunkBody)
   check("fwchunk header is 4 bytes (data at 5)", cp == 5, cp)
   check("boot0 reads chunk data at the cursor", chunkBody:sub(cp) == data)
+
+  -- imageDigest: deterministic, and every hashed block stays under the 8 KB soft
+  -- limit even for a large image (so the data card never has to pause).
+  local big = ("x"):rep(40000)
+  local maxBlk = 0
+  local d1 = hx.imageDigest(big, function(s) maxBlk = math.max(maxBlk, #s); return fakeHmac(s, "") end)
+  local d2 = hx.imageDigest(big, function(s) return fakeHmac(s, "") end)
+  check("imageDigest deterministic", d1 == d2 and #d1 == 32)
+  check("imageDigest blocks stay under 8KB", maxBlk <= 4096, maxBlk)
+  check("imageDigest differs on change",
+    hx.imageDigest(big .. "!", function(s) return fakeHmac(s, "") end) ~= d1)
 end
 
 -- mini radio simulator: multi-hop flood + coverage convergence ------------

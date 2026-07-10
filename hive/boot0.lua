@@ -50,6 +50,14 @@ local function ver(f)
   return dat.sha256(b:sub(1, 4) .. "\0" .. b:sub(6), k):sub(1, ML) == f.mac
 end
 
+-- Block digest matching hxnet.imageDigest (data card sha256 can't hash the whole
+-- image in one call -- direct callback, no pause over the soft limit).
+local function digest(b)
+  local p = {}
+  for i = 1, #b, 4096 do p[#p + 1] = dat.sha256(b:sub(i, i + 4095)) end
+  return dat.sha256(table.concat(p))
+end
+
 st("JOIN...")
 local qn = { x = 0, y = 64, z = 0 }
 local no = dat.random(8)
@@ -86,7 +94,7 @@ while true do
       local pt = {}
       for i = 0, meta.ct - 1 do pt[#pt + 1] = rx[i] end
       local img = table.concat(pt)
-      if dat.sha256(img) == meta.sha then
+      if digest(img) == meta.sha then
         st("RUN v" .. meta.vr)
         _HX = { id = id, key = k, role = role, port = port, queen = qn,
           home = { x = hx, y = hy, z = hz }, fw = meta.vr, joined = true }

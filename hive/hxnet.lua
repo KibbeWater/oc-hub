@@ -337,6 +337,17 @@ function hxnet.tx(image, chunkSize)
   }
 end
 
+-- Digest a large image without tripping the data card's per-call size limit: the
+-- card's sha256 is a DIRECT callback and can't pause, so inputs over the ~8 KB soft
+-- limit return nil. Hash each <=blk block, then hash the concatenation of block
+-- hashes. Deterministic given shaFn; the queen and boot0 compute it identically.
+function hxnet.imageDigest(bytes, shaFn, blk)
+  blk = blk or 4096
+  local parts = {}
+  for i = 1, #bytes, blk do parts[#parts + 1] = shaFn(bytes:sub(i, i + blk - 1)) end
+  return shaFn(table.concat(parts))
+end
+
 -- Reassembler with NAK support. add() is 0-indexed and idempotent.
 function hxnet.rx(count, chunkSize, size)
   local parts, have = {}, 0

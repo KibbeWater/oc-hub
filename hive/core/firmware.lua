@@ -5,6 +5,8 @@
 -- the built bytes change, so OTA can tell "newer" from "same".
 -- Install to /usr/lib/hive/core/firmware.lua.
 
+local hxnet = require("hxnet")
+
 local firmware = {}
 
 -- Wrap module sources + an entry expression into one loadable chunk. Each module
@@ -64,7 +66,8 @@ function firmware.new(opts)
 
     local bundled = firmware.bundle(modules, entry)
     local stripped, stats = optimize(bundled)
-    local digest = sha(stripped)
+    -- block-hash so a large image doesn't hit the data card's single-call limit
+    local digest = hxnet.imageDigest(stripped, sha)
 
     -- bump version if the bytes changed
     local rec = versions[role]
